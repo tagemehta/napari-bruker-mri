@@ -52,10 +52,28 @@ def _read_jcampdx_value(path: Path, key: str) -> str:
 
 @dataclass
 class ExpNode:
-    """A single experiment (scan) folder inside a Study."""
+    """
+    A single experiment (scan) folder inside a Study.
+
+    Metadata (sequence name, scan description) is loaded lazily on first
+    access so scanning a large patient list stays fast.
+
+    Attributes
+    ----------
+    study_path:
+        Path to the parent Study folder (contains the ``subject`` file).
+    exp_id:
+        Numeric folder name, e.g. ``"3"``.
+    study_name:
+        Human-readable study label propagated from ``StudyNode.study_name``,
+        used to build the napari layer name (e.g. ``"Rat Spine 690728 - 9"``).
+    """
 
     study_path: Path
     exp_id: str  # numeric folder name, e.g. "3"
+    study_name: str = (
+        ""  # human-readable study name for display, e.g. "Rat Spine 690728"
+    )
 
     # Populated lazily via _load_metadata()
     _sequence: str = field(default="", init=False, repr=False)
@@ -64,9 +82,11 @@ class ExpNode:
 
     @property
     def path(self) -> Path:
+        """Absolute path to this experiment folder."""
         return self.study_path / self.exp_id
 
     def _load_metadata(self) -> None:
+        """Read sequence and description from ``acqp`` / ``method`` on first call."""
         if self._metadata_loaded:
             return
         acqp = self.path / "acqp"
@@ -81,25 +101,30 @@ class ExpNode:
 
     @property
     def sequence(self) -> str:
+        """Pulse programme name from ``acqp`` (e.g. ``"MSME.ppg"``)."""
         self._load_metadata()
         return self._sequence
 
     @property
     def description(self) -> str:
+        """Short scan description from ``ACQ_scan_name`` / ``ACQ_protocol_name``."""
         self._load_metadata()
         return self._description
 
     @property
     def display_name(self) -> str:
+        """``"{exp_id} - {sequence}"`` e.g. ``"9 - MSME.ppg"``."""
         parts = [self.exp_id]
         if self.sequence:
             parts.append(self.sequence)
         return " - ".join(parts)
 
     def has_2dseq(self, proc_id: str = "1") -> bool:
+        """Return True if ``pdata/{proc_id}/2dseq`` exists."""
         return (self.path / "pdata" / proc_id / "2dseq").exists()
 
     def available_proc_ids(self) -> list[str]:
+        """Sorted list of proc folder names that contain a ``2dseq`` file."""
         pdata = self.path / "pdata"
         if not pdata.is_dir():
             return []
@@ -109,12 +134,26 @@ class ExpNode:
         )
 
     def proc_nodes(self) -> list[ProcNode]:
+        """Return a ``ProcNode`` for every available proc folder."""
         return [ProcNode(exp=self, proc_id=pid) for pid in self.available_proc_ids()]
 
 
 @dataclass
 class ProcNode:
-    """One processed reconstruction (pdata/N) inside an experiment."""
+    """
+    One processed reconstruction (``pdata/N``) inside an experiment.
+
+    Proc 1 is typically the raw scanner reconstruction.
+    Higher-numbered procs are derived outputs generated in ParaVision:
+    T2 maps, ADC maps, DTI tensors, etc.
+
+    Attributes
+    ----------
+    exp:
+        Parent experiment.
+    proc_id:
+        Proc folder name, e.g. ``"1"`` or ``"2"``.
+    """
 
     exp: ExpNode
     proc_id: str  # e.g. "1", "2"
@@ -125,9 +164,11 @@ class ProcNode:
 
     @property
     def pdata_path(self) -> Path:
+        """Absolute path to this proc folder (``…/pdata/{proc_id}``)."""
         return self.exp.path / "pdata" / self.proc_id
 
     def _load_meta(self) -> None:
+        """Read protocol label and series comment from ``visu_pars`` on first call."""
         if self._meta_loaded:
             return
         visu = self.pdata_path / "visu_pars"
@@ -139,11 +180,13 @@ class ProcNode:
 
     @property
     def protocol(self) -> str:
+        """Acquisition protocol name from ``VisuAcquisitionProtocol`` (meaningful for proc 1)."""
         self._load_meta()
         return self._label
 
     @property
     def comment(self) -> str:
+        """Series comment from ``VisuSeriesComment`` (describes derived procs: T2 map, ADC, …)."""
         self._load_meta()
         return self._comment
 
@@ -156,7 +199,13 @@ class ProcNode:
 
 @dataclass
 class StudyNode:
-    """A single Bruker Study folder (subject info + experiments)."""
+    """
+    A single Bruker Study folder containing the ``subject`` file and
+    one numeric sub-folder per experiment (scan).
+
+    Subject metadata (name, study name, date) is read lazily from the
+    ``subject`` JCAMP-DX file on first access.
+    """
 
     path: Path
 
@@ -167,6 +216,7 @@ class StudyNode:
     _meta_loaded: bool = field(default=False, init=False, repr=False)
 
     def _load_meta(self) -> None:
+        """Read subject name, study name, and date from the ``subject`` file on first call."""
         if self._meta_loaded:
             return
         subject_file = self.path / "subject"
@@ -182,16 +232,19 @@ class StudyNode:
 
     @property
     def subject_name(self) -> str:
+        """Animal/subject identifier from ``SUBJECT_name_string`` or ``SUBJECT_id``."""
         self._load_meta()
         return self._name
 
     @property
     def study_name(self) -> str:
+        """Human-readable study label from ``SUBJECT_study_name`` (e.g. ``"Rat Spine 690728"``)."""
         self._load_meta()
         return self._study_name
 
     @property
     def date(self) -> str:
+        """Acquisition date/time string from ``SUBJECT_date``."""
         self._load_meta()
         return self._date
 
@@ -206,17 +259,23 @@ class StudyNode:
     @property
     def experiments(self) -> list[ExpNode]:
         if self._experiments is None:
-            self._experiments = _scan_experiments(self.path)
+            self._experiments = _scan_experiments(self.path, self.study_name)
         return self._experiments
 
 
-def _scan_experiments(study_path: Path) -> list[ExpNode]:
+def _scan_experiments(study_path: Path, study_name: str = "") -> list[ExpNode]:
     """Return sorted ExpNodes for all numeric sub-folders with acqp."""
     nodes: list[ExpNode] = []
     try:
         for entry in sorted(study_path.iterdir(), key=lambda e: _sort_key(e.name)):
             if entry.is_dir() and entry.name.isdigit() and (entry / "acqp").exists():
-                nodes.append(ExpNode(study_path=study_path, exp_id=entry.name))
+                nodes.append(
+                    ExpNode(
+                        study_path=study_path,
+                        exp_id=entry.name,
+                        study_name=study_name,
+                    )
+                )
     except OSError:
         pass
     return nodes
@@ -231,15 +290,27 @@ def _sort_key(name: str) -> tuple[int, str]:
 
 @dataclass
 class PatientNode:
-    """Represents a patient directory containing one or more StudyNodes."""
+    """
+    Represents one patient/animal entry in the tree.
+
+    In Layout A (patient folders containing study folders) `path` is the
+    patient folder and all its study sub-folders are returned.
+
+    In Layout B (study folders sitting directly inside the root) each
+    PatientNode wraps exactly one study folder passed via `_single_study`.
+    `path` is still the parent root so the PatientNode can be constructed
+    consistently, but `studies` returns only the pinned study.
+    """
 
     path: Path
-
+    _single_study: Path | None = field(default=None, repr=False)
     _studies: list[StudyNode] | None = field(default=None, init=False, repr=False)
 
     @property
     def display_name(self) -> str:
-        """Use the subject name from the first study if available, else folder name."""
+        """Folder name is the most reliable unique identifier per animal."""
+        if self._single_study is not None:
+            return self._single_study.name
         studies = self.studies
         if studies:
             name = studies[0].subject_name
@@ -250,12 +321,15 @@ class PatientNode:
     @property
     def studies(self) -> list[StudyNode]:
         if self._studies is None:
-            self._studies = _scan_studies(self.path)
+            if self._single_study is not None:
+                self._studies = [StudyNode(path=self._single_study)]
+            else:
+                self._studies = _scan_studies(self.path)
         return self._studies
 
 
 def _scan_studies(patient_path: Path) -> list[StudyNode]:
-    """Return StudyNodes for all sub-folders that look like Bruker studies."""
+    """Return StudyNodes for all sub-folders of *patient_path* that contain a ``subject`` file."""
     nodes: list[StudyNode] = []
     try:
         for entry in sorted(patient_path.iterdir(), key=lambda e: e.name):
@@ -304,12 +378,13 @@ def scan_patient_list(root: str | Path) -> list[PatientNode]:
     except OSError:
         return patients
 
-    # Layout B: root contains study folders directly (each has a 'subject' file)
+    # Layout B: root contains study folders directly (each has a 'subject' file).
+    # Each study folder is its own animal/patient — give each its own PatientNode
+    # so the tree shows one top-level entry per study rather than one giant group.
     direct_studies = [e for e in entries if (e / "subject").exists()]
     if direct_studies:
-        # Group all direct studies under one synthetic patient node whose path is root.
-        # PatientNode.display_name will use the subject name from the first study.
-        patients.append(PatientNode(path=root))
+        for study_dir in direct_studies:
+            patients.append(PatientNode(path=study_dir.parent, _single_study=study_dir))
         return patients
 
     # Layout A: root contains patient folders that in turn contain study folders

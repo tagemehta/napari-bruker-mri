@@ -4,8 +4,7 @@ BrukerTreeWidget — four-level collapsible tree:
 
 Users can:
   - Click "Open Patient Folder" to choose the root patients directory.
-  - Double-click a proc row to load it into the next free tile slot.
-  - Drag a proc row onto a specific tile slot.
+  - Double-click a proc row to load it into the napari viewer as a layer.
 """
 
 from __future__ import annotations
@@ -44,13 +43,22 @@ class BrukerTreeWidget(QWidget):
     """
     Left-panel dock widget: Patient → Study → Experiment → Proc tree.
 
+    The user clicks "Open Patient Folder…" to choose a root directory.
+    ``scan_patient_list`` detects the layout (A / B / C) automatically and
+    populates the tree.  Double-clicking a proc row emits
+    ``experiment_activated`` so the main window can load it into napari.
+
     Signals
     -------
-    experiment_activated(study_path: str, exp_id: str, proc_id: str)
-        Emitted when the user double-clicks a proc item.
+    experiment_activated(study_path, exp_id, proc_id, study_name)
+        Emitted when the user double-clicks a proc item.  All arguments are
+        strings.  ``study_name`` is the human-readable label from the study's
+        ``subject`` file (e.g. ``"Rat Spine 690728"``).
     """
 
-    experiment_activated = Signal(str, str, str)  # study_path, exp_id, proc_id
+    experiment_activated = Signal(
+        str, str, str, str
+    )  # study_path, exp_id, proc_id, study_name
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -61,6 +69,7 @@ class BrukerTreeWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        """Construct the toolbar button, root-path label, and tree widget."""
         self.setMinimumWidth(340)
 
         layout = QVBoxLayout(self)
@@ -98,6 +107,7 @@ class BrukerTreeWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_open_folder(self) -> None:
+        """Open a directory chooser and load the selected root into the tree."""
         folder = QFileDialog.getExistingDirectory(
             self, "Select Patient List Folder", str(Path.home())
         )
@@ -112,6 +122,7 @@ class BrukerTreeWidget(QWidget):
             str(proc_node.exp.study_path),
             proc_node.exp.exp_id,
             proc_node.proc_id,
+            proc_node.exp.study_name,
         )
 
     # ------------------------------------------------------------------
@@ -119,6 +130,7 @@ class BrukerTreeWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _load_root(self, root: str) -> None:
+        """Clear the tree and populate it from *root* via ``scan_patient_list``."""
         self._root_label.setText(root)
         self._tree.clear()
 
@@ -170,6 +182,12 @@ class BrukerTreeWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _mime_data_for_items(self, items: list[QTreeWidgetItem]) -> QMimeData:
+        """
+        Build MIME data for a drag operation from a proc row.
+
+        Encodes ``study_path``, ``exp_id``, and ``proc_id`` as JSON under the
+        ``application/x-bruker-experiment`` MIME type.
+        """
         mime = QMimeData()
         for item in items:
             proc_node = item.data(COL_ID, _PROC_ROLE)

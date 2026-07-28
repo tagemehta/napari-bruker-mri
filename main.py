@@ -5,40 +5,39 @@ Run with:
     uv run python main.py
 
 Layout:
-    Left dock  : BrukerTreeWidget  (Patient → Study → Experiment tree)
-    Right dock : TiledViewerWidget (2×2 image slots)
+    Left dock  : BrukerTreeWidget  (Patient → Study → Experiment → Proc tree)
+    Centre     : napari viewer     (images loaded here as layers)
+    Right dock : FrameGroupWidget  (dropdowns to switch echoes / T2 params / etc.)
 
-Double-click an experiment in the tree to load it into the next empty slot.
-Drag an experiment from the tree onto a specific slot for precise placement.
+Double-click a proc row in the tree to load it as a napari layer.
+Loading the same proc again replaces the existing layer in-place.
+
+Contrast is handled by napari's built-in controls.  Auto-contrast is enabled
+per layer so limits update as you scroll through slices.
 """
 
 import napari
 
-from bruker_browser.tile_viewer import TiledViewerWidget
+from bruker_browser.tile_viewer import load_into_viewer
 from bruker_browser.tree_widget import BrukerTreeWidget
+from windowing import FrameGroupWidget
 
 
 def main() -> None:
     viewer = napari.Viewer(title="Bruker MRI Viewer")
 
-    # --- Left panel: study browser tree ---
     tree_widget = BrukerTreeWidget()
+    viewer.window.add_dock_widget(tree_widget, name="Study Browser", area="left")
     viewer.window.add_dock_widget(
-        tree_widget,
-        name="Study Browser",
-        area="left",
+        FrameGroupWidget(viewer), name="Frame Groups", area="right"
     )
 
-    # --- Right panel: 2×2 image slots ---
-    tile_widget = TiledViewerWidget(viewer=viewer)
-    viewer.window.add_dock_widget(
-        tile_widget,
-        name="Image Slots",
-        area="right",
+    # Wire double-click directly to napari viewer
+    tree_widget.experiment_activated.connect(
+        lambda study_path, exp_id, proc_id, study_name: load_into_viewer(
+            viewer, study_path, exp_id, proc_id, study_name=study_name
+        )
     )
-
-    # Wire double-click in the tree to loading into the next free slot
-    tree_widget.experiment_activated.connect(tile_widget.load_into_next_slot)
 
     napari.run()
 

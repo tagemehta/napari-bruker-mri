@@ -8,4 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
-patients/sample_data/**
+
+# Raw MRI data (large, source-of-truth on scanner)
+patients/**
+
+# Computed outputs (reproducible from raw data + code)
+results/maps/
+results/rois/
+results/*.csv
