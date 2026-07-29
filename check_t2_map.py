@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 from pathlib import Path
 
 from analysis.fitting import T2_MAX_MS, T2_MIN_MS, fit_t2_monoexp
-from analysis.maps import _parse_te_labels, get_t2_map, match_slices_to_proc1
+from analysis.maps import _parse_te_labels, get_pv_t2_map, match_slices_to_proc1
 from bruker_browser.loader import load_2dseq
 
 # ── change these to explore different studies / discs ──────────────────────
@@ -63,12 +63,12 @@ def main() -> None:
     echoes_full = np.moveaxis(raw.data, echo_fg.axis, 0)  # (n_echo, [Z,] H, W)
 
     print("Loading PV T2 map (proc 2)...")
-    pv_map = get_t2_map(study_path, EXP_ID, study_name=STUDY_NAME)
-    print(f"  source={pv_map.source}  shape={pv_map.data.shape}")
-    if pv_map.source != "pv":
+    pv_map = get_pv_t2_map(study_path, EXP_ID, study_name=STUDY_NAME)
+    if pv_map is None:
         raise SystemExit(
             f"No PV T2 map available for {STUDY_NAME} exp {EXP_ID} — nothing to compare against."
         )
+    print(f"  shape={pv_map.data.shape}")
 
     print("Matching PV map slice(s) to proc-1 slice indices (by VisuCorePosition)...")
     slice_idx = match_slices_to_proc1(study_path, EXP_ID, proc_id="2")

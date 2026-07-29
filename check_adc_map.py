@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 from pathlib import Path
 
 from analysis.fitting import ADC_MAX_MM2S, ADC_MIN_MM2S, fit_adc_monoexp
-from analysis.maps import _read_dw_eff_bval, get_adc_map, match_slices_to_proc1
+from analysis.maps import _read_dw_eff_bval, get_pv_adc_map, match_slices_to_proc1
 from bruker_browser.loader import load_2dseq
 
 # ── change these to explore different studies / discs ──────────────────────
@@ -65,12 +65,12 @@ def main() -> None:
     highb_anatomy = frames[int(np.argmax(b_values))]
 
     print("Loading PV ADC map (proc 2)...")
-    pv_map = get_adc_map(study_path, EXP_ID, study_name=STUDY_NAME)
-    print(f"  source={pv_map.source}  shape={pv_map.data.shape}")
-    if pv_map.source != "pv":
+    pv_map = get_pv_adc_map(study_path, EXP_ID, study_name=STUDY_NAME)
+    if pv_map is None:
         raise SystemExit(
             f"No PV ADC map available for {STUDY_NAME} exp {EXP_ID} — nothing to compare against."
         )
+    print(f"  shape={pv_map.data.shape}")
 
     print("Matching PV map slice(s) to proc-1 slice indices (by VisuCorePosition)...")
     slice_idx = match_slices_to_proc1(study_path, EXP_ID, proc_id="2")

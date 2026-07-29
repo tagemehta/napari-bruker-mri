@@ -41,7 +41,7 @@ import napari
 import numpy as np
 
 from analysis.fitting import fit_adc_monoexp
-from analysis.maps import match_slices_to_proc1
+from analysis.maps import _read_dw_eff_bval, get_pv_adc_map, match_slices_to_proc1
 from bruker_browser.loader import load_2dseq
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -73,39 +73,6 @@ def _estimate_noise_sigma(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
     """
     diff = frame_a.astype(float) - frame_b.astype(float)
     return float(np.std(diff) / np.sqrt(2))
-
-
-def _read_dw_eff_bval(method_path: Path) -> list[float]:
-    """Parse ``PVM_DwEffBval`` (one float per DWI frame, s/mm^2) from ``method``."""
-    text = method_path.read_text(encoding="latin-1", errors="replace")
-    m = re.search(r"##\$PVM_DwEffBval=\([^\n]*\)\s*\n(.*?)(?=\n##|\n\$\$)", text, re.DOTALL)
-    if not m:
-        raise RuntimeError(f"PVM_DwEffBval not found in {method_path}")
-    return [float(x) for x in m.group(1).split()]
-
-
-def _try_load_pv_adc(study_path: Path, exp_id: str, study_name: str):
-    """Extract PV's combined ADC map from proc 2, or None if unavailable."""
-    proc2_2dseq = study_path / exp_id / "pdata" / "2" / "2dseq"
-    if not proc2_2dseq.exists():
-        return None
-    try:
-        result = load_2dseq(
-            study_path, exp_id=exp_id, proc_id="2", study_name=study_name, zoom_to=0
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Could not load proc 2: %s", exc)
-        return None
-
-    for fg in result.frame_groups:
-        if fg.name != "FG_ISA":
-            continue
-        for i, label in enumerate(fg.labels):
-            if "diffusion constant" in label.lower():
-                data = np.take(result.data, i, axis=fg.axis).astype(float)
-                data[data == 0.0] = np.nan
-                return data, label
-    return None
 
 
 def main() -> None:
@@ -202,7 +169,7 @@ def main() -> None:
     print("    noise-floor bias becomes significant for this kind of fit.")
 
     print("Looking for PV's combined ADC map (proc 2)...")
-    pv_adc = _try_load_pv_adc(study_path, EXP_ID, STUDY_NAME)
+    pv_adc = get_pv_adc_map(study_path, EXP_ID, STUDY_NAME)
 
     scale = raw.scale[: frames.ndim - 1] if frames.ndim > 3 else raw.scale
     # drop the direction/movie axis from scale (already excluded by moveaxis+indexing)
@@ -268,7 +235,8 @@ def main() -> None:
     )
 
     if pv_adc is not None:
-        data, label = pv_adc
+        data = pv_adc.data
+        label = pv_adc.meta.get("pv_label", "?")
         print(f"  PV ADC label: {label!r}  shape={data.shape}")
         if data.shape != spread.shape:
             print("  Shape differs from proc 1 — matching slices via VisuCorePosition...")

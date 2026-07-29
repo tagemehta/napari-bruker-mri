@@ -13,6 +13,4 @@ wheels/
 patients/**
 
 # Computed outputs (reproducible from raw data + code)
-results/maps/
-results/rois/
-results/*.csv
+parameter_maps/

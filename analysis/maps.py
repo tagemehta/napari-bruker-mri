@@ -1,46 +1,58 @@
 """
 Unified T2 / ADC map access.
 
-Decision logic for ADC
------------------------
-Mirrors T2: check ``pdata/2/2dseq`` for an FG_ISA frame labelled
-"diffusion constant" (PV's ``dtraceb`` macro output) first; fall back to
-fitting a fresh combined ("trace") ADC from proc 1's DWI stack using all 3
-diffusion directions' own trace-corrected effective b-values
-(``PVM_DwEffBval``) if proc 2 is absent or has no ADC frame. See
-``analysis/fitting.py`` module docstring and AGENTS.md for the model
-details (why "trace" ADC, not DTI/IVIM/DKI, given this dataset's
-acquisition).
+Two families of entry point, deliberately kept separate — neither ever
+falls back to the other, so a caller always knows exactly where its map's
+numbers came from:
 
-This module is the single entry point for obtaining a quantitative map for
-one disc (one experiment within a study).  It decides automatically whether
-to use a ParaVision-generated proc 2 map or to fit one fresh from the raw
-echo stack, and always returns the map at **native (non-upsampled) resolution**
-so values are physically correct.
+- ``get_pv_t2_map`` / ``get_pv_adc_map`` — PV-only: extract ParaVision's own
+  proc 2 map. Returns ``None`` if proc 2 doesn't exist or has no matching
+  ISA frame; never fits anything itself. Used by ``check_t2_map.py`` /
+  ``check_adc_map.py`` (whose whole job is comparing PV against a fresh
+  fit) and by ``analyze_disc.py``'s smoke check.
+- ``fit_t2_map`` / ``fit_adc_map`` — fit-only: always fit fresh from proc 1,
+  never touch proc 2. This is what ``analyze_disc.py`` (the per-disc ROI
+  analysis pipeline) uses to generate the maps it saves and computes ROI
+  stats against — results should never depend on whether ParaVision
+  happened to have already computed a map for a given experiment.
 
-Decision logic for T2
----------------------
+Both families return the map at **native (non-upsampled) resolution** so
+values are physically correct, and record where a map came from in
+``MapResult.source`` (``"pv"`` or ``"fitted"``) so callers can report it.
+
+PV extraction (``get_pv_t2_map`` / ``get_pv_adc_map``)
+-------------------------------------------------------
 1. Check whether ``pdata/2/2dseq`` exists.
-2. If yes: load proc 2, look for an FG_ISA frame labelled "T2 relaxation time".
+2. If yes: load proc 2, look for an FG_ISA frame labelled "T2 relaxation
+   time" (T2) or "diffusion constant" (ADC, PV's ``dtraceb`` macro output).
 3. If found: extract that frame → ``source = "pv"``.
-4. If proc 2 is absent, or has no T2 ISA frame:
-   load proc 1 echo stack + echo times → fit mono-exponential → ``source = "fitted"``.
+4. Otherwise: return ``None``.
 
-The source is recorded in ``MapResult.source`` so callers can report it and
-notebook 01 can compare PV vs fitted side-by-side.
+Fitting (``fit_t2_map`` / ``fit_adc_map``)
+---------------------------------------------
+Loads proc 1's raw stack (echo stack for T2, DWI stack for ADC) and fits
+pixel-by-pixel — mono-exponential T2, or combined ("trace") ADC pooling all
+3 diffusion directions' own trace-corrected effective b-values
+(``PVM_DwEffBval``). See ``analysis/fitting.py`` module docstring and
+AGENTS.md for the model details (why "trace" ADC, not DTI/IVIM/DKI, given
+this dataset's acquisition).
 
 Saving / loading
 ----------------
-Maps are saved as ``results/maps/{study_name}_exp{exp_id}_t2.npy`` with a
+Maps are saved as ``parameter_maps/{study_name}_exp{exp_id}_t2.npy`` with a
 companion ``.json`` carrying scale, source, and fitting metadata.
-``save_map`` / ``load_map`` handle both files atomically.
+``save_map`` / ``load_map`` handle both files atomically. ``parameter_maps/``
+is a dedicated top-level folder (sibling to ``patients/``) for all generated
+maps, ROIs (``analysis/rois.py``), and the aggregated stats CSV, kept
+separate from raw acquisition data.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -49,6 +61,8 @@ import numpy as np
 _log = logging.getLogger(__name__)
 
 MapSource = Literal["pv", "fitted"]
+
+PARAMETER_MAPS_DIR = "parameter_maps"
 
 
 # ---------------------------------------------------------------------------
@@ -95,110 +109,297 @@ class MapResult:
 # ---------------------------------------------------------------------------
 
 
-def get_t2_map(
+def fit_t2_map(
     study_path: Path | str,
     exp_id: str,
     study_name: str = "",
 ) -> MapResult:
     """
-    Return a T2 map for one disc experiment.
+    Always fit a fresh T2 map from proc 1's echo stack — never uses PV's
+    proc 2 map.
 
-    Tries to use the PV-generated proc 2 "T2 relaxation time" ISA frame first.
-    Falls back to fitting the raw proc 1 MSME echo stack if proc 2 is absent
-    or does not contain a T2 frame.
-
-    Parameters
-    ----------
-    study_path:
-        Path to the Bruker study folder (contains the ``subject`` file).
-    exp_id:
-        Experiment number as a string (e.g. ``"9"``).
-    study_name:
-        Human-readable label used in saved filenames and ``MapResult``.
-        Defaults to the study folder name.
-
-    Returns
-    -------
-    MapResult
-        T2 map at native resolution with provenance metadata.
+    Used by ``analyze_disc.py``: per-disc analysis always generates its own
+    map, so results don't depend on whether ParaVision happened to compute
+    one for this experiment. Compare against PV's own map only as a
+    separate smoke check (``get_pv_t2_map``), never as the analysis source.
     """
     study_path = Path(study_path)
     if not study_name:
         study_name = study_path.name
-
-    # Try PV proc 2 first
-    pv_result = _try_load_pv_t2(study_path, exp_id, study_name)
-    if pv_result is not None:
-        _log.info(
-            "T2 map for %s exp %s: using PV proc 2 (%s)",
-            study_name,
-            exp_id,
-            pv_result.meta.get("pv_label", "?"),
-        )
-        return pv_result
-
-    # Fall back to fitting
-    _log.info(
-        "T2 map for %s exp %s: no valid PV proc 2 — fitting from echo stack",
-        study_name,
-        exp_id,
-    )
     return _fit_t2_from_proc1(study_path, exp_id, study_name)
 
 
-def get_adc_map(
+def fit_adc_map(
     study_path: Path | str,
     exp_id: str,
     study_name: str = "",
 ) -> MapResult:
     """
-    Return a combined ("trace") ADC map for one disc experiment.
+    Always fit a fresh combined ("trace") ADC map from proc 1's DWI stack —
+    never uses PV's proc 2 map.
 
-    Tries to use PV's own proc 2 "diffusion constant" ISA frame first
-    (``dtraceb`` macro). Falls back to fitting the raw proc 1 DWI stack
-    (all 3 diffusion directions pooled, trace-corrected b-values) if proc 2
-    is absent or has no ADC frame.
+    See ``fit_t2_map`` docstring — same rationale.
+    """
+    study_path = Path(study_path)
+    if not study_name:
+        study_name = study_path.name
+    return _fit_adc_from_proc1(study_path, exp_id, study_name)
 
-    Parameters
-    ----------
-    study_path:
-        Path to the Bruker study folder (contains the ``subject`` file).
-    exp_id:
-        Experiment number as a string (e.g. ``"11"``).
-    study_name:
-        Human-readable label used in saved filenames and ``MapResult``.
-        Defaults to the study folder name.
 
-    Returns
-    -------
-    MapResult
-        ADC map (mm^2/s) at native resolution with provenance metadata.
+def get_pv_t2_map(
+    study_path: Path | str, exp_id: str, study_name: str = ""
+) -> MapResult | None:
+    """
+    Extract a T2 map from ParaVision's own proc 2 "T2 relaxation time" ISA
+    frame. Never fits anything itself — returns ``None`` if proc 2 doesn't
+    exist or has no matching frame, rather than falling back to
+    ``fit_t2_map``.
+
+    Used by ``check_t2_map.py`` and ``analyze_disc.py``'s PV smoke check.
     """
     study_path = Path(study_path)
     if not study_name:
         study_name = study_path.name
 
-    pv_result = _try_load_pv_adc(study_path, exp_id, study_name)
-    if pv_result is not None:
-        _log.info(
-            "ADC map for %s exp %s: using PV proc 2 (%s)",
+    from analysis.fitting import T2_MAX_MS, T2_MIN_MS
+
+    def matches(label: str) -> bool:
+        low = label.lower()
+        return "t2" in low or "relaxation" in low
+
+    return _try_load_pv_map(
+        study_path, exp_id, study_name, "t2", matches, T2_MIN_MS, T2_MAX_MS, "ms"
+    )
+
+
+def get_pv_adc_map(
+    study_path: Path | str, exp_id: str, study_name: str = ""
+) -> MapResult | None:
+    """
+    Extract an ADC map from ParaVision's own proc 2 "diffusion constant" ISA
+    frame (excludes "std dev of diffusion constant", which also contains
+    that substring). Never fits anything itself — returns ``None`` if proc 2
+    doesn't exist or has no matching frame, rather than falling back to
+    ``fit_adc_map``.
+
+    Used by ``check_adc_map.py``/``check_diffusion_directions.py`` and
+    ``analyze_disc.py``'s PV smoke check.
+    """
+    study_path = Path(study_path)
+    if not study_name:
+        study_name = study_path.name
+
+    from analysis.fitting import ADC_MAX_MM2S, ADC_MIN_MM2S
+
+    def matches(label: str) -> bool:
+        low = label.lower()
+        return "diffusion constant" in low and "std dev" not in low
+
+    return _try_load_pv_map(
+        study_path,
+        exp_id,
+        study_name,
+        "adc",
+        matches,
+        ADC_MIN_MM2S,
+        ADC_MAX_MM2S,
+        "mm^2/s",
+    )
+
+
+def fit_anatomy_image(
+    study_path: Path | str,
+    exp_id: str,
+    study_name: str = "",
+    kind: str = "t2",
+    zoom_to: int = 0,
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
+) -> tuple[np.ndarray, tuple[float, ...]]:
+    """
+    Anatomy image on the same *physical grid* as ``fit_t2_map``/``fit_adc_map``:
+    always proc 1's own raw stack (first echo for T2, lowest-b ~b0 DWI frame
+    for ADC — highest, most reliable SNR everywhere, rather than the
+    highest-b frame where high-diffusivity tissue can sit near the Rician
+    noise floor) — never PV's proc 2 signal-intensity frame, which can cover
+    a different or reordered subset of slices than proc 1 (see AGENTS.md
+    "Two T2-map layouts").
+
+    ``zoom_to`` (default 0, i.e. native resolution — pixel-identical to the
+    map) optionally upsamples the returned image for a nicer image to trace
+    ROI boundaries on, the same cubic-spline display upsampling
+    ``bruker_browser.loader.load_2dseq`` uses elsewhere. The physical scale
+    is adjusted proportionally (see ``_zoom_spatial``), so the returned
+    image still covers the exact same real-world footprint as the map even
+    though its pixel count differs — draw ROIs on it with a napari Shapes
+    layer whose own ``scale`` is set to the *map's* scale (not this image's)
+    and the saved vertices land in native map pixel coordinates regardless
+    of this zoom. See ``analyze_disc.py`` for the intended usage.
+
+    Results are cached to ``{results_dir}/`` (same folder as the maps) so
+    reopening ``analyze_disc.py`` for the same disc skips the full
+    brukerapi load + scipy zoom on subsequent runs. The zoom level is baked
+    into the cache filename, so a change in ``ANATOMY_ZOOM_TO`` produces a
+    fresh file rather than serving a stale one.
+    """
+    study_path = Path(study_path)
+    if not study_name:
+        study_name = study_path.name
+
+    try:
+        image, scale = load_anatomy(study_name, exp_id, kind, zoom_to, results_dir)
+        _log.debug(
+            "Loaded cached anatomy for %s exp %s (%s, z%d)",
             study_name,
             exp_id,
-            pv_result.meta.get("pv_label", "?"),
+            kind,
+            zoom_to,
         )
-        return pv_result
+        return image, scale
+    except FileNotFoundError:
+        pass
 
-    _log.info(
-        "ADC map for %s exp %s: no valid PV proc 2 — fitting from DWI stack",
-        study_name,
-        exp_id,
-    )
-    return _fit_adc_from_proc1(study_path, exp_id, study_name)
+    image, scale = _anatomy_from_proc1(study_path, exp_id, study_name, kind, zoom_to)
+    save_anatomy(image, scale, study_name, exp_id, kind, zoom_to, results_dir)
+    return image, scale
 
 
-def save_map(result: MapResult, results_dir: Path | str = "results") -> Path:
+def _anatomy_from_proc1(
+    study_path: Path, exp_id: str, study_name: str, kind: str, zoom_to: int = 0
+) -> tuple[np.ndarray, tuple[float, ...]]:
+    """Anatomy image from proc 1's raw stack: first echo (T2) or lowest-b DWI frame (ADC)."""
+    from bruker_browser.loader import load_2dseq
+
+    try:
+        result = load_2dseq(
+            study_path,
+            exp_id=exp_id,
+            proc_id="1",
+            study_name=study_name,
+            zoom_to=zoom_to,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load proc 1 for {study_name} exp {exp_id}"
+        ) from exc
+
+    if kind == "t2":
+        fg = next((fg for fg in result.frame_groups if "ECHO" in fg.name), None)
+    else:
+        fg = next(
+            (
+                fg
+                for fg in result.frame_groups
+                if "MOVIE" in fg.name or "DIFFUSION" in fg.name
+            ),
+            None,
+        )
+    if fg is None:
+        raise RuntimeError(
+            f"No anatomy frame group found in proc 1 for {study_name} exp {exp_id} ({kind})"
+        )
+
+    frames = np.moveaxis(result.data, fg.axis, 0)
+    if kind == "t2":
+        image = frames[0]  # first echo
+    else:
+        # Lowest-b (~b0) frame: highest, most reliable SNR everywhere,
+        # including NP where high diffusivity can push the highest-b
+        # signal down near the Rician noise floor (see
+        # check_diffusion_directions.py's SNR-red-flag rationale) — a
+        # noisy "anatomy" image would be worse to trace ROI boundaries on
+        # than one with weaker NP/AF contrast but a real signal everywhere.
+        b_values = _read_dw_eff_bval(study_path / exp_id / "method")
+        image = frames[int(np.argmin(b_values))]
+
+    return image.astype(float), _drop_axis(result.scale, fg.axis)
+
+
+def sanitize_stem(s: str) -> str:
     """
-    Save a MapResult to ``{results_dir}/maps/``.
+    Make a human-entered string (e.g. ``SUBJECT_study_name``, which can
+    contain spaces or other free-text characters) safe to use as a
+    filename component. Replaces anything that isn't a word character,
+    dash, dot, or space with an underscore.
+    """
+    return re.sub(r"[^\w\-. ]", "_", s)
+
+
+def map_path(
+    study_name: str,
+    exp_id: str,
+    kind: str,
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
+) -> Path:
+    """Path to a saved map's ``.npy`` file, without touching disk."""
+    stem = f"{sanitize_stem(study_name)}_exp{exp_id}_{kind}"
+    return Path(results_dir) / f"{stem}.npy"
+
+
+def anatomy_path(
+    study_name: str,
+    exp_id: str,
+    kind: str,
+    zoom_to: int,
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
+) -> Path:
+    """
+    Path to a cached anatomy image ``.npy`` file, without touching disk.
+
+    The zoom level is baked into the filename so a change in
+    ``ANATOMY_ZOOM_TO`` produces a fresh cache entry rather than silently
+    serving a stale one.
+    """
+    stem = f"{sanitize_stem(study_name)}_exp{exp_id}_{kind}_anatomy_z{zoom_to}"
+    return Path(results_dir) / f"{stem}.npy"
+
+
+def save_anatomy(
+    image: np.ndarray,
+    scale: tuple[float, ...],
+    study_name: str,
+    exp_id: str,
+    kind: str,
+    zoom_to: int,
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
+) -> Path:
+    """Cache an anatomy image to disk as ``{stem}.npy`` + ``{stem}_scale.json``."""
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    npy = anatomy_path(study_name, exp_id, kind, zoom_to, results_dir)
+    json_path = npy.with_suffix(".json")
+    np.save(npy, image)
+    json_path.write_text(json.dumps({"scale": list(scale)}))
+    _log.debug("Cached anatomy to %s", npy)
+    return npy
+
+
+def load_anatomy(
+    study_name: str,
+    exp_id: str,
+    kind: str,
+    zoom_to: int,
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
+) -> tuple[np.ndarray, tuple[float, ...]]:
+    """
+    Load a cached anatomy image.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no cached anatomy exists for this (study, exp, kind, zoom_to).
+    """
+    npy = anatomy_path(study_name, exp_id, kind, zoom_to, results_dir)
+    if not npy.exists():
+        raise FileNotFoundError(
+            f"No cached anatomy for {study_name} exp {exp_id} ({kind}, z{zoom_to}): {npy}"
+        )
+    scale = tuple(json.loads(npy.with_suffix(".json").read_text())["scale"])
+    return np.load(npy), scale
+
+
+def save_map(result: MapResult, results_dir: Path | str = PARAMETER_MAPS_DIR) -> Path:
+    """
+    Save a MapResult to ``{results_dir}/``.
 
     Writes two files:
     - ``{stem}.npy``  — the map array
@@ -207,12 +408,11 @@ def save_map(result: MapResult, results_dir: Path | str = "results") -> Path:
     Returns the path to the ``.npy`` file.
     """
     results_dir = Path(results_dir)
-    maps_dir = results_dir / "maps"
-    maps_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = f"{result.study_name}_exp{result.exp_id}_{result.kind}"
-    npy_path = maps_dir / f"{stem}.npy"
-    json_path = maps_dir / f"{stem}.json"
+    stem = f"{sanitize_stem(result.study_name)}_exp{result.exp_id}_{result.kind}"
+    npy_path = results_dir / f"{stem}.npy"
+    json_path = results_dir / f"{stem}.json"
 
     np.save(npy_path, result.data)
 
@@ -234,10 +434,10 @@ def load_map(
     study_name: str,
     exp_id: str,
     kind: str,
-    results_dir: Path | str = "results",
+    results_dir: Path | str = PARAMETER_MAPS_DIR,
 ) -> MapResult:
     """
-    Load a previously saved MapResult from ``{results_dir}/maps/``.
+    Load a previously saved MapResult from ``{results_dir}/``.
 
     Raises
     ------
@@ -245,9 +445,9 @@ def load_map(
         If the ``.npy`` or ``.json`` file does not exist.
     """
     results_dir = Path(results_dir)
-    stem = f"{study_name}_exp{exp_id}_{kind}"
-    npy_path = results_dir / "maps" / f"{stem}.npy"
-    json_path = results_dir / "maps" / f"{stem}.json"
+    stem = f"{sanitize_stem(study_name)}_exp{exp_id}_{kind}"
+    npy_path = results_dir / f"{stem}.npy"
+    json_path = results_dir / f"{stem}.json"
 
     if not npy_path.exists():
         raise FileNotFoundError(
@@ -269,188 +469,124 @@ def load_map(
 
 
 # ---------------------------------------------------------------------------
-# Internal: PV map extraction
+# Internal: PV proc-2 extraction
 # ---------------------------------------------------------------------------
 
 
-def _try_load_pv_t2(
-    study_path: Path,
-    exp_id: str,
-    study_name: str,
-) -> MapResult | None:
+def _load_proc2(study_path: Path, exp_id: str, study_name: str):
     """
-    Attempt to extract a T2 map from PV proc 2.
-
-    Returns None if proc 2 does not exist or does not contain a frame
-    labelled "T2 relaxation time" in its FG_ISA axis.
+    Load an experiment's proc 2 (derived-map) dataset at native resolution,
+    or return None if it doesn't exist or fails to load.
     """
-    proc2_2dseq = study_path / exp_id / "pdata" / "2" / "2dseq"
-    if not proc2_2dseq.exists():
+    if not (study_path / exp_id / "pdata" / "2" / "2dseq").exists():
         return None
-
     try:
         from bruker_browser.loader import load_2dseq
 
-        result = load_2dseq(
-            study_path,
-            exp_id=exp_id,
-            proc_id="2",
-            study_name=study_name,
-            zoom_to=0,  # always native resolution for analysis
+        return load_2dseq(
+            study_path, exp_id=exp_id, proc_id="2", study_name=study_name, zoom_to=0
         )
     except Exception as exc:  # noqa: BLE001
         _log.warning("Could not load proc 2 for %s exp %s: %s", study_name, exp_id, exc)
         return None
 
-    # Find an FG_ISA axis whose labels contain a T2 entry
-    t2_fg = None
-    t2_idx = None
-    t2_label = None
+
+def _extract_isa_frame(
+    result, matches
+) -> tuple[np.ndarray, tuple[float, ...], str] | None:
+    """
+    Return ``(data, scale, label)`` for the first FG_ISA frame whose label
+    satisfies ``matches(label)`` — a single derived-map plane with the
+    FG_ISA axis dropped — or None if no frame matches.
+
+    PV packs several derived planes (the map, its std-dev, the base signal
+    image, …) into one FG_ISA axis; every proc-2 extraction here is "pick
+    the plane whose label matches, drop that axis".
+    """
     for fg in result.frame_groups:
         if fg.name != "FG_ISA":
             continue
         for i, label in enumerate(fg.labels):
-            if "t2" in label.lower() or "relaxation" in label.lower():
-                t2_fg = fg
-                t2_idx = i
-                t2_label = label
-                break
-        if t2_fg is not None:
-            break
+            if matches(label):
+                data = np.take(result.data, i, axis=fg.axis)
+                return data, _drop_axis(result.scale, fg.axis), label
+    return None
 
-    if t2_fg is None:
-        _log.debug(
-            "proc 2 for %s exp %s has no T2 ISA frame (labels: %s)",
-            study_name,
-            exp_id,
-            [fg.labels for fg in result.frame_groups],
-        )
-        return None
 
-    # Extract the T2 frame by indexing the FG_ISA axis
-    data = np.take(result.data, t2_idx, axis=t2_fg.axis)
-    scale = _drop_axis(result.scale, t2_fg.axis)
-
-    # PV uses 0 as a sentinel for "not fitted" pixels (background, failed fits).
-    # Replace with NaN so downstream stats (np.nanmean etc.) ignore them correctly.
-    data = data.astype(float)
-    data[data == 0.0] = np.nan
-
-    # PV T2 maps are stored in ms but sometimes scaled by a factor — values
-    # outside the plausibility range are a signal to check units.
-    from analysis.fitting import T2_MAX_MS, T2_MIN_MS
-
+def _warn_if_implausible(
+    data: np.ndarray,
+    lo: float,
+    hi: float,
+    unit: str,
+    study_name: str,
+    exp_id: str,
+    kind: str,
+) -> None:
+    """Log a warning if fewer than 10% of a PV map's pixels fall in ``[lo, hi]`` (a units red flag)."""
     n_total = int(np.sum(~np.isnan(data)))
-    n_plausible = int(np.sum((data >= T2_MIN_MS) & (data <= T2_MAX_MS)))
-    if n_total > 0 and n_plausible / n_total < 0.1:
+    if n_total == 0:
+        return
+    n_plausible = int(np.sum((data >= lo) & (data <= hi)))
+    if n_plausible / n_total < 0.1:
         _log.warning(
-            "PV T2 map for %s exp %s: only %d/%d pixels in plausible range "
-            "[%.0f–%.0f ms]. Check units.",
+            "PV %s map for %s exp %s: only %d/%d pixels in plausible range [%g-%g %s]. Check units.",
+            kind.upper(),
             study_name,
             exp_id,
             n_plausible,
             n_total,
-            T2_MIN_MS,
-            T2_MAX_MS,
+            lo,
+            hi,
+            unit,
         )
 
-    return MapResult(
-        data=data,
-        scale=scale,
-        kind="t2",
-        source="pv",
-        study_name=study_name,
-        exp_id=exp_id,
-        meta={"pv_label": t2_label, "pv_isa_axis": t2_fg.axis, "pv_isa_index": t2_idx},
-    )
 
-
-def _try_load_pv_adc(
+def _try_load_pv_map(
     study_path: Path,
     exp_id: str,
     study_name: str,
+    kind: str,
+    matches,
+    lo: float,
+    hi: float,
+    unit: str,
 ) -> MapResult | None:
     """
-    Attempt to extract an ADC map from PV proc 2.
+    Extract a derived map (``kind``) from PV proc 2 — shared by T2 and ADC.
 
-    Returns None if proc 2 does not exist or does not contain a frame
-    labelled "diffusion constant" in its FG_ISA axis. Excludes the "std dev
-    of diffusion constant" frame, which also contains that substring.
+    Returns None if proc 2 is absent or has no FG_ISA frame matching
+    ``matches``. PV uses 0 as a "not fitted" sentinel, replaced with NaN so
+    downstream stats ignore it; ``[lo, hi]``/``unit`` drive a units-sanity
+    warning.
     """
-    proc2_2dseq = study_path / exp_id / "pdata" / "2" / "2dseq"
-    if not proc2_2dseq.exists():
+    result = _load_proc2(study_path, exp_id, study_name)
+    if result is None:
         return None
 
-    try:
-        from bruker_browser.loader import load_2dseq
-
-        result = load_2dseq(
-            study_path,
-            exp_id=exp_id,
-            proc_id="2",
-            study_name=study_name,
-            zoom_to=0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("Could not load proc 2 for %s exp %s: %s", study_name, exp_id, exc)
-        return None
-
-    adc_fg = None
-    adc_idx = None
-    adc_label = None
-    for fg in result.frame_groups:
-        if fg.name != "FG_ISA":
-            continue
-        for i, label in enumerate(fg.labels):
-            low = label.lower()
-            if "diffusion constant" in low and "std dev" not in low:
-                adc_fg = fg
-                adc_idx = i
-                adc_label = label
-                break
-        if adc_fg is not None:
-            break
-
-    if adc_fg is None:
+    frame = _extract_isa_frame(result, matches)
+    if frame is None:
         _log.debug(
-            "proc 2 for %s exp %s has no ADC ISA frame (labels: %s)",
+            "proc 2 for %s exp %s has no %s ISA frame (labels: %s)",
             study_name,
             exp_id,
+            kind.upper(),
             [fg.labels for fg in result.frame_groups],
         )
         return None
 
-    data = np.take(result.data, adc_idx, axis=adc_fg.axis)
-    scale = _drop_axis(result.scale, adc_fg.axis)
-
-    # PV uses 0 as a sentinel for "not fitted" pixels.
+    data, scale, label = frame
     data = data.astype(float)
     data[data == 0.0] = np.nan
-
-    from analysis.fitting import ADC_MAX_MM2S, ADC_MIN_MM2S
-
-    n_total = int(np.sum(~np.isnan(data)))
-    n_plausible = int(np.sum((data >= ADC_MIN_MM2S) & (data <= ADC_MAX_MM2S)))
-    if n_total > 0 and n_plausible / n_total < 0.1:
-        _log.warning(
-            "PV ADC map for %s exp %s: only %d/%d pixels in plausible range "
-            "[%.5f-%.5f mm^2/s]. Check units.",
-            study_name,
-            exp_id,
-            n_plausible,
-            n_total,
-            ADC_MIN_MM2S,
-            ADC_MAX_MM2S,
-        )
+    _warn_if_implausible(data, lo, hi, unit, study_name, exp_id, kind)
 
     return MapResult(
         data=data,
         scale=scale,
-        kind="adc",
+        kind=kind,
         source="pv",
         study_name=study_name,
         exp_id=exp_id,
-        meta={"pv_label": adc_label, "pv_isa_axis": adc_fg.axis, "pv_isa_index": adc_idx},
+        meta={"pv_label": label},
     )
 
 
@@ -474,8 +610,8 @@ def _fit_adc_from_proc1(
         If proc 1 cannot be loaded, has no diffusion frame group, or
         ``PVM_DwEffBval`` cannot be parsed from ``method``.
     """
-    from bruker_browser.loader import load_2dseq
     from analysis.fitting import fit_adc_monoexp
+    from bruker_browser.loader import load_2dseq
 
     try:
         result = load_2dseq(
@@ -485,13 +621,17 @@ def _fit_adc_from_proc1(
             study_name=study_name,
             zoom_to=0,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise RuntimeError(
             f"Could not load proc 1 for {study_name} exp {exp_id}"
         ) from exc
 
     dw_fg = next(
-        (fg for fg in result.frame_groups if "MOVIE" in fg.name or "DIFFUSION" in fg.name),
+        (
+            fg
+            for fg in result.frame_groups
+            if "MOVIE" in fg.name or "DIFFUSION" in fg.name
+        ),
         None,
     )
     if dw_fg is None:
@@ -550,8 +690,8 @@ def _fit_t2_from_proc1(
     RuntimeError
         If proc 1 cannot be loaded or has no FG_ECHO axis.
     """
-    from bruker_browser.loader import load_2dseq
     from analysis.fitting import fit_t2_monoexp
+    from bruker_browser.loader import load_2dseq
 
     try:
         result = load_2dseq(
@@ -561,7 +701,7 @@ def _fit_t2_from_proc1(
             study_name=study_name,
             zoom_to=0,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise RuntimeError(
             f"Could not load proc 1 for {study_name} exp {exp_id}"
         ) from exc
@@ -664,7 +804,9 @@ def _read_dw_eff_bval(method_path: Path) -> list[float]:
     import re
 
     text = method_path.read_text(encoding="latin-1", errors="replace")
-    m = re.search(r"##\$PVM_DwEffBval=\([^\n]*\)\s*\n(.*?)(?=\n##|\n\$\$)", text, re.DOTALL)
+    m = re.search(
+        r"##\$PVM_DwEffBval=\([^\n]*\)\s*\n(.*?)(?=\n##|\n\$\$)", text, re.DOTALL
+    )
     if not m:
         raise RuntimeError(f"PVM_DwEffBval not found in {method_path}")
     return [float(x) for x in m.group(1).split()]
@@ -722,6 +864,4 @@ def match_slices_to_proc1(
             f"(proc 1 or proc {proc_id})"
         )
 
-    return [
-        min(range(len(pos1)), key=lambda i: math.dist(p2, pos1[i])) for p2 in pos2
-    ]
+    return [min(range(len(pos1)), key=lambda i: math.dist(p2, pos1[i])) for p2 in pos2]

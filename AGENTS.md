@@ -121,10 +121,12 @@ patients/real_data/
 
 ## T2 map fitting (`analysis/`)
 
-`analysis/maps.py::get_t2_map` is the single entry point: it uses PV's own
-proc-2 map when present (`source="pv"`), and falls back to fitting a fresh
-map from the proc-1 echo stack when proc 2 is absent (`source="fitted"`) —
-not every study has a T2 map on disk. The from-scratch fit
+`analysis/maps.py` has two separate entry points, neither falling back to
+the other: `get_pv_t2_map` extracts PV's own proc-2 map (`source="pv"`,
+returns `None` if proc 2 has no T2 frame), and `fit_t2_map` always fits a
+fresh map from the proc-1 echo stack (`source="fitted"`) regardless of
+whether proc 2 exists — see the "Per-disc ROI analysis" section below for
+why these are kept strictly separate. The from-scratch fit
 (`analysis/fitting.py::fit_t2_monoexp`) was built to reproduce PV's own
 fitted values as closely as possible, since PV's fit is the ground truth
 users compare against.
@@ -207,16 +209,105 @@ median/1ms/5ms agreement stats to the console. Useful checks: disc tissue
 partial-volume or B1 issues; background pixels should be NaN (transparent)
 in the fitted map even where PV shows spurious high T2 values.
 
+## Per-disc ROI analysis (`analyze_disc.py`, `analysis/rois.py`, `parameter_browser.py`)
+
+For each disc, generate T2 + ADC maps, draw ROIs (NP/AF and any number of
+named variants, e.g. "NP sample 1"), and extract mean/min/max/SD per ROI.
+Two separate pieces, kept deliberately simple and decoupled:
+
+- **`analyze_disc.py`** — standalone script (same style as `check_t2_map.py`):
+  edit `STUDY_PATH`/`STUDY_NAME`/`EXP_ID_T2`/`EXP_ID_ADC` constants, run it.
+  Always fits fresh T2 + ADC via `fit_t2_map`/`fit_adc_map` (native res,
+  saved to `parameter_maps/`) — never uses ParaVision's own proc-2 map as
+  the analysis source, so results don't depend on whether PV happened to
+  already compute one. PV's map, when available, is loaded separately
+  (`get_pv_t2_map`/`get_pv_adc_map`) purely as a smoke check: a printed
+  agreement stat plus a hidden `"... — PV (smoke check)"` layer, never used
+  for ROI stats. Opens napari with each map's own signal-intensity anatomy
+  image — via `analysis.maps.fit_anatomy_image` — plus one dynamic Shapes
+  layer per map ("T2 ROIs"/"ADC ROIs", `analysis.rois.add_roi_shapes_layer`)
+  and a `RoiAnnotatorWidget` dock (`roi_annotator_widget.py`) rebuilding
+  ParaVision's own "New -> pick shape -> draw -> named object" workflow:
+  click a layer to target its map, click New, pick Polygon/Circle, trace —
+  the shape is auto-named "ROI 1", "ROI 2", ... and listed live; double-click
+  a list entry to rename/tag it (NP/AF). No fixed slots, no terminal
+  prompts. After you close the window, it rasterizes + computes stats +
+  upserts into `parameter_maps/roi_stats.csv`.
+- **`parameter_browser.py`** — small **read-only** dock widget wired into
+  `main.py`, next to the tree browser. When you load a study, it lists
+  whatever `analyze_disc.py` already generated for that study and loads a
+  selected map (+ its ROIs) into the viewer on button click. It never
+  generates or draws anything — that split keeps the live app free of any
+  async/threading code for the ~10-60s fits.
+
+**Two parallel families in `analysis/maps.py`, deliberately kept separate,
+neither falling back to the other**: `get_pv_t2_map`/`get_pv_adc_map` are
+PV-only (extract PV's proc-2 map, return `None` if it doesn't exist or has
+no matching frame) — that's what `check_t2_map.py`/`check_adc_map.py` use,
+since their whole purpose is comparing PV against a fresh fit, and what
+`analyze_disc.py` uses for its smoke check. `fit_t2_map`/`fit_adc_map`
+always fit from proc 1 and never touch proc 2 — that's what
+`analyze_disc.py` uses for the maps it actually saves and computes ROI
+stats against, since per-disc analysis should always be your own generated
+result. `fit_anatomy_image` is the matching
+anatomy function for the always-fit family (always proc 1, pairs with
+`fit_t2_map`/`fit_adc_map`); there's no PV-preferred equivalent since
+`check_t2_map.py`/`check_adc_map.py` build their own anatomy image directly
+from the same proc 1 stack they already load for fitting. **Don't mix
+families** — PV's proc 2 can cover a different/reordered subset of slices
+than proc 1 (see "Two T2-map layouts" below), so an always-fit map
+(spanning all of proc 1's slices) paired with anything PV-sourced (often a
+single PV-map slice) can silently land on different slice counts.
+`analyze_disc.py` asserts the shapes match as a backstop.
+
+**What the anatomy image is**: PV's proc 2 for a T2/ADC map always includes
+a `"signal intensity"` FG_ISA frame alongside the parameter frame itself
+(e.g. T2 proc 2 labels: `['absolute bias', ..., 'signal intensity', ...,
+'T2 relaxation time', ...]`) — this is the base image ParaVision itself
+shows you, but `analyze_disc.py` never reads it. `fit_anatomy_image` always
+reads proc 1's own raw stack instead (first echo for T2, lowest-b ~b0 DWI
+frame for ADC — highest, most reliable SNR everywhere; the highest-b frame
+was tried first but rejected since high-diffusivity tissue like NP can sit
+near the Rician noise floor there, making it a worse image to trace ROI
+boundaries on despite its stronger NP/AF contrast), matching
+`fit_t2_map`/`fit_adc_map`'s own proc-1-only source exactly. `match_slices_to_proc1` is unrelated to this — it's for
+comparing proc 2 against proc 1's own slice ordering (used by
+`check_t2_map.py`/`check_adc_map.py`).
+
+**Why ROIs are never shared between T2 and ADC**: verified against real
+data (`RA_2022_07_20.f22` exp 6/7, same disc) that T2 (MSME) and ADC
+(DtiEpi) acquisitions have different FOV, matrix size, *and* in-plane
+center offset — e.g. FOV 10×12mm/48×60 vs 20.8×12mm/128×72, offsets that
+don't match either. Projecting one ROI across both grids would need real
+affine registration; instead each anatomy image shares its own map's exact
+native grid (both come from the same acquisition), so ROIs always
+rasterize straight onto the array they were drawn against — no coordinate
+transform anywhere. See `analysis/rois.py` module docstring.
+
+**Storage**: `parameter_maps/` (top-level, sibling to `patients/`, gitignored):
+```
+parameter_maps/
+  {study_name}_exp{exp_id}_t2.npy / .json
+  {study_name}_exp{exp_id}_adc.npy / .json
+  rois/{study_name}_exp{exp_id}_{t2,adc}.json
+  roi_stats.csv
+```
+`study_name` (from `SUBJECT_study_name`, e.g. `"Rat Spine 690731"`) is
+sanitized for filenames via `analysis.maps.sanitize_stem`. Re-running
+`analyze_disc.py` for the same disc updates its `roi_stats.csv` rows in
+place (keyed by study/exp/roi_name/map_kind) instead of duplicating them.
+
 ## ADC map fitting (`analysis/`)
 
-`analysis/maps.py::get_adc_map` mirrors `get_t2_map`: uses PV's own proc-2
-"diffusion constant" ISA frame (`dtraceb` macro) when present
-(`source="pv"`), falls back to fitting a combined ("trace") ADC from proc 1's
-DWI stack — all 3 diffusion directions pooled with their trace-corrected
-effective b-values (`PVM_DwEffBval`) — when proc 2 is absent
-(`source="fitted"`). The fit (`analysis/fitting.py::fit_adc_monoexp`) uses
-the same `scipy.optimize.least_squares` + analytic-Jacobian +
-`ProcessPoolExecutor` architecture as the T2 fit.
+`analysis/maps.py` mirrors the T2 split: `get_pv_adc_map` extracts PV's own
+proc-2 "diffusion constant" ISA frame (`dtraceb` macro, `source="pv"`,
+`None` if absent), and `fit_adc_map` always fits a combined ("trace") ADC
+from proc 1's DWI stack — all 3 diffusion directions pooled with their
+trace-corrected effective b-values (`PVM_DwEffBval`) — regardless of
+whether proc 2 exists (`source="fitted"`). The fit
+(`analysis/fitting.py::fit_adc_monoexp`) uses the same
+`scipy.optimize.least_squares` + analytic-Jacobian + `ProcessPoolExecutor`
+architecture as the T2 fit.
 
 ### Model
 

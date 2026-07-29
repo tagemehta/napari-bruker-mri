@@ -287,7 +287,7 @@ def fit_t2_monoexp(
         Multiprocessing here uses the "spawn" start method on macOS and
         Windows, which re-imports the calling script in each worker.  Any
         script that calls this with more than one process (directly or via
-        :func:`~analysis.maps.get_t2_map`) **must** guard its top-level
+        :func:`~analysis.maps.fit_t2_map`) **must** guard its top-level
         execution with ``if __name__ == "__main__":`` — see ``main.py`` /
         ``check_maps.py`` — or the workers will re-run the whole script.
 

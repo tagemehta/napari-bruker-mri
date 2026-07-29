@@ -5,9 +5,11 @@ Run with:
     uv run python main.py
 
 Layout:
-    Left dock  : BrukerTreeWidget  (Patient → Study → Experiment → Proc tree)
-    Centre     : napari viewer     (images loaded here as layers)
-    Right dock : FrameGroupWidget  (dropdowns to switch echoes / T2 params / etc.)
+    Left dock  : BrukerTreeWidget       (Patient → Study → Experiment → Proc tree)
+    Centre     : napari viewer          (images loaded here as layers)
+    Right dock : FrameGroupWidget       (dropdowns to switch echoes / T2 params / etc.)
+    Right dock : ParameterBrowserWidget (load previously generated T2/ADC maps + ROIs
+                                          for the current study — see analyze_disc.py)
 
 Double-click a proc row in the tree to load it as a napari layer.
 Loading the same proc again replaces the existing layer in-place.
@@ -20,6 +22,7 @@ import napari
 
 from bruker_browser.tile_viewer import load_into_viewer
 from bruker_browser.tree_widget import BrukerTreeWidget
+from parameter_browser import ParameterBrowserWidget
 from windowing import FrameGroupWidget
 
 
@@ -31,6 +34,10 @@ def main() -> None:
     viewer.window.add_dock_widget(
         FrameGroupWidget(viewer), name="Frame Groups", area="right"
     )
+    parameter_browser = ParameterBrowserWidget(viewer)
+    viewer.window.add_dock_widget(
+        parameter_browser, name="Parameter Maps", area="right"
+    )
 
     # Wire double-click directly to napari viewer
     tree_widget.experiment_activated.connect(
@@ -38,6 +45,7 @@ def main() -> None:
             viewer, study_path, exp_id, proc_id, study_name=study_name
         )
     )
+    tree_widget.experiment_activated.connect(parameter_browser.on_experiment_activated)
 
     napari.run()
 
