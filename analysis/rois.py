@@ -194,12 +194,7 @@ def rasterize_roi(roi: RoiRecord, mask_shape: tuple[int, ...]) -> np.ndarray:
     return layer.to_masks(mask_shape)[0]
 
 
-_ROI_EDGE_WIDTH = 1.0  # thin outline, in *data-index* units (one native pixel wide) —
-# napari always scales edge_width by the layer's physical `scale`, and on
-# these maps one data-index unit is already only ~0.16-0.2mm, so anything
-# much below 1.0 renders sub-pixel and effectively disappears once the
-# layer isn't being actively drawn/selected (selection handles are drawn
-# separately from edge_width and stay visible regardless).
+_ROI_EDGE_WIDTH = 0.1  # thin outline — native map grids are only tens of pixels across
 
 
 def add_roi_shapes_layer(
