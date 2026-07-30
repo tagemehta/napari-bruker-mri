@@ -124,7 +124,7 @@ def load_2dseq(
     exp_id: str,
     proc_id: str = "1",
     study_name: str = "",
-    zoom_to: int = 256,
+    zoom_to: int = 0,
 ) -> LoadResult:
     """
     Load a 2dseq dataset using brukerapi and return a LoadResult.

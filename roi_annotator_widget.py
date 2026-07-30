@@ -2,10 +2,20 @@
 RoiAnnotatorWidget — dock widget for interactive ROI drawing.
 
 Rebuilds ParaVision's own "New -> pick shape -> draw -> named object"
-annotation workflow inside napari: click New, choose Polygon or Circle,
+annotation workflow inside napari: click New, choose Polygon or Rectangle,
 trace it on the canvas, and it's immediately auto-labelled "ROI 1",
 "ROI 2", ... and listed here. Draw as many as you want for a disc in one
-uninterrupted pass, then double-click a list entry to rename/tag it.
+uninterrupted pass, then double-click a list entry (or select it and click
+"Rename Selected") to rename/tag it.
+
+Rectangle ("square") sizing is fixed for annotation consistency: every
+freshly drawn rectangle spawns as a 2x2px (4px area) box regardless of the
+drag gesture (see analysis/rois.py::_SQUARE_SPAWN_SIDE_PX) — resize it with
+napari's own handles if you want it bigger. The instant you finish a resize
+(mouse release), it snaps live to the nearest of 4/9/16px area (2x2/3x3/4x4)
+(analysis/rois.py::_snap_selected_rectangles_on_release), so you see the
+snap happen on-canvas rather than only discovering it once saved — every
+persisted rectangle is one of exactly three sizes.
 
 Whichever layer is selected in napari's own layer list when "New" is
 clicked decides which map ("target") the new ROI belongs to. Each target
@@ -36,7 +46,7 @@ from qtpy.QtWidgets import (
 _log = logging.getLogger(__name__)
 
 # Maps the combo box's display text to the napari Shapes drawing mode it arms.
-_SHAPE_MODES = {"Polygon": "add_polygon", "Circle": "add_ellipse"}
+_SHAPE_MODES = {"Polygon": "add_polygon", "Rectangle": "add_rectangle"}
 _ROLE = Qt.UserRole
 
 
@@ -102,6 +112,10 @@ class RoiAnnotatorWidget(QWidget):
         self._finish_button.clicked.connect(self._on_finish)
         button_row.addWidget(self._finish_button)
         layout.addLayout(button_row)
+
+        rename_button = QPushButton("Rename Selected")
+        rename_button.clicked.connect(self._on_rename_selected)
+        layout.addWidget(rename_button)
 
         delete_button = QPushButton("Delete Selected")
         delete_button.clicked.connect(self._on_delete)
@@ -191,8 +205,14 @@ class RoiAnnotatorWidget(QWidget):
                 item.setData(_ROLE, (target.target_name, i))
                 self._list.addItem(item)
 
+    def _on_rename_selected(self) -> None:
+        """Rename button handler — same as double-clicking the selected list entry."""
+        item = self._list.currentItem()
+        if item is not None:
+            self._on_rename(item)
+
     def _on_rename(self, item: QListWidgetItem) -> None:
-        """Rename a shape and (optionally) set its tissue tag via two small dialogs."""
+        """Rename a shape via a single text dialog."""
         target_name, idx = item.data(_ROLE)
         target = self._targets[target_name]
         names = list(target.shapes_layer.properties.get("name", []))
@@ -206,17 +226,6 @@ class RoiAnnotatorWidget(QWidget):
         if not ok or not new_name.strip():
             return
         names[idx] = new_name.strip()
-
-        new_tissue, ok = QInputDialog.getItem(
-            self,
-            "Tissue",
-            "Tissue:",
-            ["NP", "AF"],
-            current=0 if (idx >= len(tissues) or tissues[idx] != "AF") else 1,
-            editable=False,
-        )
-        if ok:
-            tissues[idx] = new_tissue
 
         target.shapes_layer.properties = {
             "name": np.array(names, dtype=object),

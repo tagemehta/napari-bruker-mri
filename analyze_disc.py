@@ -24,11 +24,11 @@ What this does
    - ADC anatomy + ADC map + one "ADC ROIs" Shapes layer
    - A "ROI Annotator" dock widget (see ``roi_annotator_widget.py``)
      rebuilding ParaVision's own annotation workflow: click a T2 or ADC
-     layer to target that map, click New, pick Polygon or Circle, trace
+     layer to target that map, click New, pick Polygon or Rectangle, trace
      it — it's immediately auto-named "ROI 1", "ROI 2", ... and listed in
-     the widget.  Double-click a list entry to rename/tag it (NP/AF).
-     Draw as many ROIs per map as you want; previously saved ROIs are
-     pre-populated. No fixed slots, no terminal prompts.
+     the widget.  Double-click a list entry (or "Rename Selected") to
+     rename it. Draw as many ROIs per map as you want; previously saved
+     ROIs are pre-populated.
 3. When you close napari, stats (mean/min/max/SD) are computed per ROI
    against its own map and upserted into parameter_maps/roi_stats.csv.
 
@@ -77,10 +77,10 @@ from analysis.rois import (
 from roi_annotator_widget import RoiAnnotatorWidget
 
 # ── change these to analyze a different disc ────────────────────────────────
-STUDY_PATH = "patients/real_data/RA_2022_07_20.f22"
-STUDY_NAME = "Rat Spine 690731"
-EXP_ID_T2 = "6"
-EXP_ID_ADC = "7"
+STUDY_PATH = "patients/real_data/RA_2022_07_21.f32"
+STUDY_NAME = "690068"
+EXP_ID_T2 = "9"
+EXP_ID_ADC = "10"
 # Set to True to force a fresh fit even if a previously-saved map exists.
 REFIT = False
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,9 +309,7 @@ def main() -> None:
 
     # ── collect, validate, save ─────────────────────────────────────────────
     t2_rois = collect_rois_from_shapes_layer(t2_shapes, STUDY_NAME, EXP_ID_T2, "t2")
-    adc_rois = collect_rois_from_shapes_layer(
-        adc_shapes, STUDY_NAME, EXP_ID_ADC, "adc"
-    )
+    adc_rois = collect_rois_from_shapes_layer(adc_shapes, STUDY_NAME, EXP_ID_ADC, "adc")
 
     save_rois(t2_rois, STUDY_NAME, EXP_ID_T2, "t2")
     save_rois(adc_rois, STUDY_NAME, EXP_ID_ADC, "adc")

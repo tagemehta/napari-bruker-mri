@@ -93,6 +93,14 @@ class MapResult:
         Experiment folder name (e.g. ``"9"``).
     meta:
         Extra provenance: echo times used, PV ISA label, fit statistics, etc.
+    diagnostics:
+        Per-pixel fit-quality arrays, same shape as ``data`` — ``s0``
+        (extrapolated signal at TE=0/b=0), ``bias`` (fitted noise-floor
+        offset ``A``), ``r2`` (goodness of fit). ``None`` for PV-sourced
+        maps (``source="pv"``), which were never fit here. Lets a saved map
+        be re-inspected later (see ``inspect_roi_fit.py``) without redoing
+        the fit — e.g. plotting an ROI's measured signal decay against its
+        fitted curve.
     """
 
     data: np.ndarray
@@ -102,6 +110,7 @@ class MapResult:
     study_name: str
     exp_id: str
     meta: dict
+    diagnostics: dict[str, np.ndarray] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +410,12 @@ def save_map(result: MapResult, results_dir: Path | str = PARAMETER_MAPS_DIR) ->
     """
     Save a MapResult to ``{results_dir}/``.
 
-    Writes two files:
-    - ``{stem}.npy``  — the map array
-    - ``{stem}.json`` — scale, source, kind, and meta dict
+    Writes:
+    - ``{stem}.npy``            — the map array
+    - ``{stem}.json``           — scale, source, kind, and meta dict
+    - ``{stem}_diagnostics.npz`` — per-pixel s0/bias/r2, only if
+      ``result.diagnostics`` is set (fitted maps only; not written at all
+      for PV-sourced maps, rather than writing an empty file)
 
     Returns the path to the ``.npy`` file.
     """
@@ -415,6 +427,9 @@ def save_map(result: MapResult, results_dir: Path | str = PARAMETER_MAPS_DIR) ->
     json_path = results_dir / f"{stem}.json"
 
     np.save(npy_path, result.data)
+
+    if result.diagnostics is not None:
+        np.savez(results_dir / f"{stem}_diagnostics.npz", **result.diagnostics)
 
     meta_out = {
         "scale": list(result.scale),
@@ -457,6 +472,12 @@ def load_map(
     data = np.load(npy_path)
     meta_in = json.loads(json_path.read_text())
 
+    diagnostics_path = results_dir / f"{stem}_diagnostics.npz"
+    diagnostics = None
+    if diagnostics_path.exists():
+        with np.load(diagnostics_path) as npz:
+            diagnostics = {k: npz[k] for k in npz.files}
+
     return MapResult(
         data=data,
         scale=tuple(meta_in["scale"]),
@@ -465,6 +486,7 @@ def load_map(
         study_name=meta_in["study_name"],
         exp_id=meta_in["exp_id"],
         meta=meta_in["meta"],
+        diagnostics=diagnostics,
     )
 
 
@@ -674,6 +696,7 @@ def _fit_adc_from_proc1(
             "n_failed": fit.n_failed,
             "n_out_of_range": fit.n_out_of_range,
         },
+        diagnostics={"s0": fit.s0, "bias": fit.bias, "r2": fit.r2},
     )
 
 
@@ -746,6 +769,7 @@ def _fit_t2_from_proc1(
             "n_failed": fit.n_failed,
             "n_out_of_range": fit.n_out_of_range,
         },
+        diagnostics={"s0": fit.s0, "bias": fit.bias, "r2": fit.r2},
     )
 
 

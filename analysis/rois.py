@@ -31,12 +31,16 @@ import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import re
+
 import numpy as np
 import pandas as pd
 
 from analysis.maps import PARAMETER_MAPS_DIR, sanitize_stem
 
 _log = logging.getLogger(__name__)
+
+_ROI_NAME_RE = re.compile(r"^ROI\s+(\d+)$", re.IGNORECASE)
 
 ROI_STATS_COLUMNS = [
     "study_name",
@@ -196,6 +200,62 @@ def rasterize_roi(roi: RoiRecord, mask_shape: tuple[int, ...]) -> np.ndarray:
 
 _ROI_EDGE_WIDTH = 0.1  # thin outline — native map grids are only tens of pixels across
 
+# Rectangle ("square") ROIs are kept to a small, fixed set of sizes for
+# annotation consistency — native map grids are small enough (tens of
+# px/axis) that free-hand rectangles vary wildly in pixel count otherwise.
+# A freshly drawn rectangle always spawns at this fixed side length,
+# regardless of how big the draw gesture was...
+_SQUARE_SPAWN_SIDE_PX = 2.0  # -> 4px area
+# ...and whatever size it's resized to (via napari's own resize handles)
+# gets snapped to whichever of these areas is closest the moment that resize
+# gesture finishes (mouse release — see _snap_selected_rectangles_on_release
+# in add_roi_shapes_layer), so the snap is visible live on-canvas. This is
+# the *only* place snapping happens — deliberately not repeated at save
+# time, so what's saved is always exactly what's on-canvas, no surprise
+# silent resize. Polygons are untouched throughout — this only ever applies
+# to shape_type == "rectangle".
+_ALLOWED_SQUARE_AREAS = (4.0, 9.0, 16.0)
+
+
+def _rect_center(verts: np.ndarray) -> np.ndarray:
+    """Center (Y, X) of a rectangle's bounding box."""
+    spatial = np.asarray(verts, dtype=float)[:, -2:]
+    return (spatial.min(axis=0) + spatial.max(axis=0)) / 2.0
+
+
+def _square_vertices(center: np.ndarray, side: float, leading: np.ndarray) -> np.ndarray:
+    """
+    Build a rectangle's 4 corner vertices for an axis-aligned square of
+    ``side`` pixels centered at ``center`` (Y, X). ``leading`` is the
+    non-spatial (e.g. Z) coordinate prefix, copied to all 4 corners.
+    """
+    half = side / 2.0
+    lo = center - half
+    hi = center + half
+    corners_spatial = np.array(
+        [[lo[0], lo[1]], [lo[0], hi[1]], [hi[0], hi[1]], [hi[0], lo[1]]]
+    )
+    leading_rows = np.tile(leading, (4, 1))
+    return np.hstack([leading_rows, corners_spatial])
+
+
+def _snap_to_nearest_square_vertices(verts: np.ndarray) -> np.ndarray:
+    """
+    Snap a rectangle's current bounding box to the nearest allowed area
+    (see ``_ALLOWED_SQUARE_AREAS``), producing a true square (equal Y/X
+    side) centered on its current center.
+    """
+    verts = np.asarray(verts, dtype=float)
+    spatial = verts[:, -2:]
+    lo = spatial.min(axis=0)
+    hi = spatial.max(axis=0)
+    size = hi - lo
+    area = float(size[0] * size[1])
+    nearest_area = min(_ALLOWED_SQUARE_AREAS, key=lambda a: abs(a - area))
+    side = nearest_area**0.5
+    center = (lo + hi) / 2.0
+    return _square_vertices(center, side, verts[0, :-2])
+
 
 def add_roi_shapes_layer(
     viewer,
@@ -245,18 +305,29 @@ def add_roi_shapes_layer(
         }
 
     # New interactively-drawn shapes start blank; the callback below fills
-    # in "ROI N" (N = draw order) the moment each one is finished.
+    # in "ROI N" (N = one more than the highest existing "ROI <n>" name) the
+    # moment each one is finished.
     _blank_properties = {
         "name": np.array([""], dtype=object),
         "tissue": np.array([""], dtype=object),
     }
     layer.current_properties = _blank_properties
 
-    # Boxed (not a plain local) so the closure below can persist a running
-    # count across multiple calls — each call only sees however many blanks
-    # remain *at that moment*, which isn't the same as overall draw order
-    # once earlier blanks have already been filled in.
-    _next_roi_number = [1]
+    def _next_roi_number(names: list) -> int:
+        """
+        One more than the highest ``"ROI <n>"`` name currently present, not
+        a running count — so deleting the highest-numbered ROI frees its
+        number again (1..6, delete "ROI 6" -> next is "ROI 6" again), while
+        deleting a lower one doesn't (1..6, delete "ROI 2" -> next is still
+        "ROI 7"). Renamed ROIs (anything not matching the pattern) are
+        simply ignored when computing the max.
+        """
+        nums = [
+            int(match.group(1))
+            for name in names
+            if (match := _ROI_NAME_RE.match(str(name).strip()))
+        ]
+        return max(nums, default=0) + 1
 
     def _autofill_blank_names(event=None) -> None:
         names = list(layer.properties.get("name", []))
@@ -264,8 +335,7 @@ def add_roi_shapes_layer(
         changed = False
         for i in range(len(names)):
             if not str(names[i]).strip():
-                names[i] = f"ROI {_next_roi_number[0]}"
-                _next_roi_number[0] += 1
+                names[i] = f"ROI {_next_roi_number(names)}"
                 changed = True
         if changed:
             layer.properties = {
@@ -280,6 +350,68 @@ def add_roi_shapes_layer(
         layer.current_properties = _blank_properties
 
     layer.events.data.connect(_autofill_blank_names)
+
+    # Tracks how many shapes existed as of the last event, so a growth in
+    # shape count (vs. a resize/delete of an existing one) can be detected —
+    # only freshly-added rectangles get forced to the spawn size below.
+    # Starts at len(rois) so preloaded ROIs (added above, before this
+    # callback is connected) are never touched by it.
+    _known_shape_count = [len(rois)]
+
+    def _force_spawn_square_size(event=None) -> None:
+        n = len(layer.data)
+        if n <= _known_shape_count[0]:
+            # Shrunk (delete) or unchanged (a resize of an existing shape,
+            # which is intentionally left alone until save) — just resync.
+            _known_shape_count[0] = n
+            return
+        new_data = list(layer.data)
+        changed = False
+        for i in range(_known_shape_count[0], n):
+            if layer.shape_type[i] != "rectangle":
+                continue
+            center = _rect_center(new_data[i])
+            leading = np.asarray(new_data[i], dtype=float)[0, :-2]
+            new_data[i] = _square_vertices(center, _SQUARE_SPAWN_SIDE_PX, leading)
+            changed = True
+        # Updated before the mutating assignment below so the nested
+        # events.data fire it triggers (napari's Shapes.data setter fires
+        # synchronously mid-assignment) sees n <= _known_shape_count[0] and
+        # returns immediately instead of recursing.
+        _known_shape_count[0] = n
+        if changed:
+            layer.data = new_data
+
+    layer.events.data.connect(_force_spawn_square_size)
+
+    def _snap_selected_rectangles_on_release(layer, event):
+        """
+        Mouse-drag callback (napari's generator convention: runs up to the
+        first ``yield`` on press, is resumed once per move, and resumes one
+        final time — past the ``while`` loop — on release) that snaps
+        whichever rectangle(s) were just dragged/resized to the nearest
+        allowed square area, live, so the snap is visible immediately
+        instead of only appearing once the ROI set is saved. A no-op for a
+        plain move (size unchanged -> already at an allowed area -> nothing
+        to snap) and for anything that isn't a rectangle.
+        """
+        yield
+        while event.type == "mouse_move":
+            yield
+        new_data = None
+        for idx in list(layer.selected_data):
+            if idx >= len(layer.data) or layer.shape_type[idx] != "rectangle":
+                continue
+            verts = np.asarray(layer.data[idx], dtype=float)
+            snapped = _snap_to_nearest_square_vertices(verts)
+            if not np.allclose(verts, snapped):
+                if new_data is None:
+                    new_data = list(layer.data)
+                new_data[idx] = snapped
+        if new_data is not None:
+            layer.data = new_data
+
+    layer.mouse_drag_callbacks.append(_snap_selected_rectangles_on_release)
     return layer
 
 
@@ -293,17 +425,25 @@ def collect_rois_from_shapes_layer(
     Build one :class:`RoiRecord` per shape currently in ``shapes_layer``
     (as created by :func:`add_roi_shapes_layer`), reading ``name``/``tissue``
     back from the layer's ``properties``.
+
+    Rectangle vertices are already snapped to an allowed square area by the
+    time they get here — live, the moment a resize gesture finishes (see
+    ``_snap_selected_rectangles_on_release`` in ``add_roi_shapes_layer`` —
+    what you see on-canvas is exactly what gets saved, no silent resize
+    happens here).
     """
     names = list(shapes_layer.properties.get("name", []))
     tissues = list(shapes_layer.properties.get("tissue", []))
     rois = []
     for i in range(len(shapes_layer.data)):
+        shape_type = shapes_layer.shape_type[i]
+        vertices = np.asarray(shapes_layer.data[i], dtype=float)
         rois.append(
             RoiRecord(
                 name=str(names[i]) if i < len(names) else f"ROI {i + 1}",
                 tissue=str(tissues[i]) if i < len(tissues) else "",
-                shape_type=shapes_layer.shape_type[i],
-                vertices=np.array(shapes_layer.data[i]).tolist(),
+                shape_type=shape_type,
+                vertices=vertices.tolist(),
                 study_name=study_name,
                 exp_id=exp_id,
                 kind=kind,
