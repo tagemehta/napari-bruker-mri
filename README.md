@@ -20,6 +20,41 @@ uv run python main.py
 
 Then click **Open Patient Folder…** in the left panel and select the directory containing your Bruker study folders.
 
+## Which file do I open? (task → script)
+
+Every script in this repo can be run standalone with `uv run python <name>.py`.
+Filenames aren't always self-explanatory, so here's a map from "what am I
+trying to do" to the file that does it:
+
+| I want to...                                                          | Open this file                     |
+|------------------------------------------------------------------------|-------------------------------------|
+| Browse raw scans / load a study into a viewer                          | `main.py`                           |
+| Generate T2 + ADC maps for one disc, draw ROIs, save stats              | `analyze_disc.py`                   |
+| See a study's already-saved maps/ROIs without regenerating anything     | *(automatic)* — `main.py`'s "Parameter Maps" dock, backed by `parameter_browser.py` |
+| Sanity-check a T2 map fit against ParaVision's own map                  | `check_t2_map.py`                   |
+| Sanity-check an ADC map fit against ParaVision's own map                 | `check_adc_map.py`                  |
+| Check per-direction diffusion signal / ADC quality for one scan         | `check_diffusion_directions.py`     |
+| Visually inspect curve-fit quality for ROIs you've already drawn       | `inspect_roi_fit.py`                |
+| Figure out which raw study folder = which rat ID                        | `index_bruker_studies.py` (writes `patients/real_data/INDEX.md`) |
+| Figure out which scans are repeats vs. genuinely different disc locations (Top vs Bottom) | `inspect_scan_positions.py` |
+| Visually confirm Top vs Bottom by projecting a scan onto the sagittal localizer | `plot_disc_positions_on_sagittal.py` |
+| Attach each ROI's irradiation Group / timepoint to its stats            | `join_roi_stats_grouping.py`        |
+| Filter out noisy/poorly-fit pixels and compare irradiated vs. control trends, with t-tests | `snr_filter_and_compare.py` |
+| Export raw Bruker scans to NIfTI (e.g. for 3D Slicer)                    | `export_nifti_studies.py`           |
+| Figure out what an exported NIfTI file actually is                      | `label_nifti_exports.py`            |
+
+All of these (except `main.py`) follow the same pattern: open the file, edit
+the constants at the top (study path, experiment ID, etc.), then
+`uv run python <file>.py`. None of them take command-line arguments.
+
+### Typical order of operations for a new disc/animal
+
+1. `index_bruker_studies.py` — confirm which raw folder corresponds to which rat.
+2. `inspect_scan_positions.py` + `plot_disc_positions_on_sagittal.py` — confirm Top vs. Bottom disc and which experiment IDs are repeats.
+3. `analyze_disc.py` — fit T2/ADC maps and draw ROIs for that disc.
+4. `join_roi_stats_grouping.py` — attach cohort/timepoint metadata to the new ROI stats.
+5. `snr_filter_and_compare.py` — re-run once new discs are added, to refresh the filtered stats and trend/t-test tables across the whole cohort.
+
 ## Data layout supported
 
 ```
@@ -146,6 +181,75 @@ result = load_2dseq(
 > **Important:** always pass `zoom_to=0` when loading data for curve fitting or
 > statistics.  The default `zoom_to=256` is for display only — fitting on
 > interpolated voxels produces incorrect parameter estimates.
+
+### How frame groups are represented in raw data
+
+A single Bruker `2dseq` file can hold more than one 2-D image per slice —
+e.g. one image per echo time (multi-echo T2), one per b-value/direction
+(diffusion), or one per fitted parameter (a T2 map's `T2`, `A`, `bias`
+images all live in the same file). Bruker calls each of these extra axes a
+**Frame Group (FG)**; ParaVision's own UI is what lets you scroll through
+them one at a time.
+
+**On disk**, brukerapi reports every axis as one flat list — spatial axes and
+frame-group axes mixed together — with a parallel `dim_type` list telling
+you which is which. Concrete example, a real 16-echo T2 acquisition with
+8 slices (`patients/real_data/RA_2022_07_18.f01`, exp 5, proc 1):
+
+```
+raw shape (brukerapi):  (150,      150,      16,        8)
+raw dim_type:           ('spatial', 'spatial', 'FG_ECHO', 'FG_SLICE')
+                              X         Y         echo      slice
+```
+
+`'spatial'` is always exactly 2 axes (X, Y), always first in brukerapi's raw
+layout. `FG_SLICE` (and equivalents `FG_SLICE_ORIENT`/`SLICE`/`FRAME`) is the
+physical slice/Z axis; everything else (`FG_ECHO`, `FG_ISA`, `FG_DIFFUSION`,
+`FG_MOVIE`, …) is a genuinely selectable axis — different echo times,
+different fitted parameters, different diffusion directions/b-values.
+
+`load_2dseq` transposes this into napari's `(..., Z, Y, X)` convention.
+For the shape above, the result is:
+
+```
+napari shape:  (8,          16,       150, 150)
+napari axes:   (FG_SLICE,   FG_ECHO,  Y,   X)
+```
+
+**Why slice ends up outermost and echo second — not the other way round:**
+`_reorder_for_napari` (`bruker_browser/loader.py`) does one purely mechanical
+thing: it reverses brukerapi's *entire* raw axis order end-to-end.
+
+```python
+new_order = fg_idx[::-1] + spatial_idx[::-1]   # fg_idx=[2,3], spatial_idx=[0,1]
+reordered = np.transpose(data, axes=new_order)  # -> [3, 2, 1, 0]
+```
+
+Raw axis order was `[X, Y, FG_ECHO, FG_SLICE]` (indices `0,1,2,3`); reversed,
+that's `[3,2,1,0]` = `[FG_SLICE, FG_ECHO, Y, X]`. There's no special-casing
+of slice vs. echo in this step — it's whatever order brukerapi happened to
+put the raw axes in, reversed. Bruker's own convention puts `FG_SLICE` last
+among the non-spatial axes in its raw layout, so it becomes first (outermost)
+after reversal. An acquisition where brukerapi reported `FG_SLICE` *before*
+`FG_ECHO` in the raw order would come out the other way round in napari —
+the code only guarantees spatial axes end up last, not any particular order
+among the FG axes.
+
+Separately — and deliberately, unlike the reversal above — `FG_SLICE` is
+excluded from `result.frame_groups` (only `FG_ECHO` appears there) by
+`_extract_frame_groups`, so the UI always presents slice as a plain
+scrollable image stack, not a labeled dropdown, regardless of where the
+reversal happened to place it in the array.
+
+So to pull out, say, the 3rd echo of a multi-echo stack, index
+`result.data` using the `.axis` position reported on the matching
+`FrameGroupInfo` in `result.frame_groups` rather than assuming a fixed axis
+number — the position (and even the presence) of each FG axis varies by
+acquisition type (see `AGENTS.md`'s "Two T2-map layouts in this dataset" for
+a second real example where the axis order differs). `analysis/maps.py` and
+`analysis/fitting.py` show the canonical pattern for consuming
+`frame_groups` when fitting T2/ADC maps from raw multi-echo/multi-b-value
+data.
 
 ## Dependencies
 
