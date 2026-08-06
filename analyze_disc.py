@@ -77,10 +77,10 @@ from analysis.rois import (
 from roi_annotator_widget import RoiAnnotatorWidget
 
 # ── change these to analyze a different disc ────────────────────────────────
-STUDY_PATH = "patients/real_data/RA_2022_07_21.f32"
-STUDY_NAME = "690068"
-EXP_ID_T2 = "9"
-EXP_ID_ADC = "10"
+STUDY_PATH = "patients/real_data/RA_2022_08_17.fv3"
+STUDY_NAME = "693429"
+EXP_ID_T2 = "5"
+EXP_ID_ADC = "6"
 # Set to True to force a fresh fit even if a previously-saved map exists.
 REFIT = False
 # ─────────────────────────────────────────────────────────────────────────────

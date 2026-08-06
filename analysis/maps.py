@@ -237,7 +237,7 @@ def fit_anatomy_image(
     map) optionally upsamples the returned image for a nicer image to trace
     ROI boundaries on, the same cubic-spline display upsampling
     ``bruker_browser.loader.load_2dseq`` uses elsewhere. The physical scale
-    is adjusted proportionally (see ``_zoom_spatial``), so the returned
+    is adjusted proportionally (see ``zoom_spatial``), so the returned
     image still covers the exact same real-world footprint as the map even
     though its pixel count differs — draw ROIs on it with a napari Shapes
     layer whose own ``scale`` is set to the *map's* scale (not this image's)
@@ -276,15 +276,22 @@ def _anatomy_from_proc1(
     study_path: Path, exp_id: str, study_name: str, kind: str, zoom_to: int = 0
 ) -> tuple[np.ndarray, tuple[float, ...]]:
     """Anatomy image from proc 1's raw stack: first echo (T2) or lowest-b DWI frame (ADC)."""
-    from bruker_browser.loader import load_2dseq
+    from bruker_browser.loader import load_2dseq, zoom_spatial
 
     try:
+        # zoom_to=0: load at native resolution and pick the one frame we
+        # need first — zooming happens below, on just that frame. Loading
+        # with zoom_to=zoom_to here would run cubic-spline interpolation
+        # (scipy.ndimage.zoom, order=3) over the *entire* echo/DWI stack
+        # before any frame is selected, costing ~N× the necessary work for
+        # an N-frame stack (see zoom_spatial's docstring / AGENTS.md
+        # "Display upsampling").
         result = load_2dseq(
             study_path,
             exp_id=exp_id,
             proc_id="1",
             study_name=study_name,
-            zoom_to=zoom_to,
+            zoom_to=0,
         )
     except Exception as exc:
         raise RuntimeError(
@@ -320,7 +327,22 @@ def _anatomy_from_proc1(
         b_values = _read_dw_eff_bval(study_path / exp_id / "method")
         image = frames[int(np.argmin(b_values))]
 
-    return image.astype(float), _drop_axis(result.scale, fg.axis)
+    image = image.astype(float)
+    scale = _drop_axis(result.scale, fg.axis)
+
+    if zoom_to and zoom_to > 1:
+        # Only the trailing two axes are true in-plane spatial axes (napari
+        # convention: spatial dims are always ordered last — see
+        # _reorder_for_napari). Anything left in front after frame selection
+        # (e.g. a real Z/slice axis) is through-plane and must not be
+        # upsampled — zoom_to controls in-plane display resolution only.
+        # Using range(image.ndim) here previously zoomed Z too, turning 8
+        # real slices into 256 interpolated ones.
+        n_spatial = min(2, image.ndim)
+        spatial_indices = list(range(image.ndim - n_spatial, image.ndim))
+        image, scale = zoom_spatial(image, scale, spatial_indices, zoom_to)
+
+    return image, scale
 
 
 def sanitize_stem(s: str) -> str:

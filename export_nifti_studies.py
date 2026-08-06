@@ -49,7 +49,7 @@ from bruker_browser.models import StudyNode
 
 # ── change these to export a different slice of the data ───────────────────
 REAL_DATA_DIR = Path("patients/real_data")
-STUDY_MONTH_FILTER = ("_07_", "_08_")  # substrings matched against folder names
+STUDY_MONTH_FILTER = ("_06_", "_07_", "_08_")  # substrings matched against folder names
 OUTPUT_DIR = Path("nifti_export")
 PROC_ID = "1"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +63,9 @@ def _iter_target_studies():
             yield entry
 
 
-def _to_nifti_array(data: np.ndarray, scale: tuple[float, ...], frame_groups) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def _to_nifti_array(
+    data: np.ndarray, scale: tuple[float, ...], frame_groups
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Convert a ``load_2dseq`` array into a NIfTI-ready one, ``(spatial...,
     [volume])``, plus a matching diagonal affine and per-volume labels.
@@ -99,7 +101,9 @@ def _to_nifti_array(data: np.ndarray, scale: tuple[float, ...], frame_groups) ->
         arr = arr.reshape(arr.shape[:n_spatial] + (n_vol,))
         import itertools
 
-        volume_labels = [" | ".join(combo) for combo in itertools.product(*(fg.labels for fg in fgs))]
+        volume_labels = [
+            " | ".join(combo) for combo in itertools.product(*(fg.labels for fg in fgs))
+        ]
 
     spatial_scale = [scale[a] for a in spatial_axes]
     if n_spatial == 2:
@@ -114,9 +118,13 @@ class NotAnImageError(Exception):
     """Raised for datasets with no spatial axes at all (e.g. 1-D spectroscopy)."""
 
 
-def export_experiment(study_path: Path, exp_id: str, study_name: str, out_dir: Path) -> Path | None:
+def export_experiment(
+    study_path: Path, exp_id: str, study_name: str, out_dir: Path
+) -> Path | None:
     """Load proc 1 of one experiment and write it out as ``{out_dir}/exp{exp_id}.nii.gz`` + sidecar."""
-    result = load_2dseq(study_path, exp_id=exp_id, proc_id=PROC_ID, study_name=study_name, zoom_to=0)
+    result = load_2dseq(
+        study_path, exp_id=exp_id, proc_id=PROC_ID, study_name=study_name, zoom_to=0
+    )
 
     if result.data.ndim - len(result.frame_groups) == 0:
         raise NotAnImageError(
@@ -124,7 +132,9 @@ def export_experiment(study_path: Path, exp_id: str, study_name: str, out_dir: P
             "not an image (e.g. 1-D spectroscopy), skipping."
         )
 
-    arr, affine, volume_labels = _to_nifti_array(result.data, result.scale, result.frame_groups)
+    arr, affine, volume_labels = _to_nifti_array(
+        result.data, result.scale, result.frame_groups
+    )
     img = nib.Nifti1Image(arr, affine)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -140,11 +150,14 @@ def export_experiment(study_path: Path, exp_id: str, study_name: str, out_dir: P
         "dim_type": result.metadata["dim_type"],
         "scale_mm": list(result.scale),
         "frame_groups": [
-            {"name": fg.name, "size": fg.size, "labels": fg.labels} for fg in result.frame_groups
+            {"name": fg.name, "size": fg.size, "labels": fg.labels}
+            for fg in result.frame_groups
         ],
         "volume_labels": volume_labels,
     }
-    nii_path.with_suffix("").with_suffix(".json").write_text(json.dumps(sidecar, indent=2))
+    nii_path.with_suffix("").with_suffix(".json").write_text(
+        json.dumps(sidecar, indent=2)
+    )
     return nii_path
 
 
@@ -161,7 +174,9 @@ def main() -> None:
                 n_skipped += 1
                 continue
             try:
-                nii_path = export_experiment(study_path, exp.exp_id, study.study_name, out_dir)
+                nii_path = export_experiment(
+                    study_path, exp.exp_id, study.study_name, out_dir
+                )
                 _log.info("  exp %-3s %-10s -> %s", exp.exp_id, exp.sequence, nii_path)
                 n_ok += 1
             except NotAnImageError as exc:
@@ -171,7 +186,13 @@ def main() -> None:
                 _log.warning("  exp %s failed: %s", exp.exp_id, exc)
                 n_failed += 1
 
-    _log.info("Done: %d exported, %d skipped (no proc %s), %d failed", n_ok, n_skipped, PROC_ID, n_failed)
+    _log.info(
+        "Done: %d exported, %d skipped (no proc %s), %d failed",
+        n_ok,
+        n_skipped,
+        PROC_ID,
+        n_failed,
+    )
 
 
 if __name__ == "__main__":

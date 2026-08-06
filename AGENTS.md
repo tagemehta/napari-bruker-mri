@@ -78,11 +78,17 @@ the position of each selectable FG in the **napari-ordered** array.
   After squeeze: `(n_params, H, W)` — single-slice parametric map.
 
 ### Display upsampling
-`_zoom_spatial(zoom_to=256)` upsamples any spatial axis below 256 px using
+`zoom_spatial(zoom_to=256)` upsamples any spatial axis below 256 px using
 cubic spline interpolation (`scipy.ndimage.zoom(order=3)`), matching
 ParaVision's default display.  The `scale` is adjusted proportionally so
 physical mm coordinates remain correct.  **Always pass `zoom_to=0` when
-loading data for fitting** — never fit on interpolated voxels.
+loading data for fitting** — never fit on interpolated voxels.  Cost scales
+with total array size, so callers that only need one frame out of a
+multi-frame stack (e.g. `analysis.maps._anatomy_from_proc1`, which only
+wants the first echo or lowest-b DWI frame) should select that frame first
+and zoom just the 2D/3D result — zooming the whole stack via
+`load_2dseq(zoom_to=...)` and discarding all but one frame wastes ~N× the
+spline work for an N-frame stack.
 
 ### Full array stored in layer metadata
 `load_into_viewer` stores the complete pre-display array in

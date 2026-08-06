@@ -206,7 +206,7 @@ def load_2dseq(
 
     # --- optional spatial upsampling to match PV display interpolation ---
     if zoom_to and zoom_to > 1:
-        data, scale = _zoom_spatial(data, scale, spatial_scale_indices, zoom_to)
+        data, scale = zoom_spatial(data, scale, spatial_scale_indices, zoom_to)
 
     _log.debug(
         "Loaded exp %s: raw shape %s dim_type %s -> napari shape %s scale %s fg=%s",
@@ -447,7 +447,7 @@ def _reorder_for_napari(
 # ---------------------------------------------------------------------------
 
 
-def _zoom_spatial(
+def zoom_spatial(
     data: np.ndarray,
     scale: tuple[float, ...],
     spatial_scale_indices: list[int],
@@ -460,7 +460,13 @@ def _zoom_spatial(
     (e.g. 48×48 MSME).  The physical scale is adjusted proportionally so that
     napari still shows correct mm coordinates.
 
-    Non-spatial (FG) axes are never resampled.
+    Non-spatial (FG) axes are never resampled. Cubic-spline prefiltering costs
+    scale with the *total* array size, not just the spatial axes, so callers
+    that only need one frame out of a multi-frame (echo/b-value) stack should
+    select that frame first and call this on just the 2D/3D result — zooming
+    the whole stack and discarding all but one frame wastes ~N× the spline
+    work for an N-frame stack (see ``analysis.maps._anatomy_from_proc1``).
+
     Axes already >= zoom_to are left unchanged.
     """
     from scipy.ndimage import zoom  # import here — only needed when zoom_to > 1

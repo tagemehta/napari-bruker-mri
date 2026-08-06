@@ -29,14 +29,19 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from analysis.maps import PARAMETER_MAPS_DIR, _parse_te_labels, _read_dw_eff_bval, load_map
+from analysis.maps import (
+    PARAMETER_MAPS_DIR,
+    _parse_te_labels,
+    _read_dw_eff_bval,
+    load_map,
+)
 from analysis.rois import load_rois, rasterize_roi
 from bruker_browser.loader import load_2dseq
 
 # ── change these to explore different studies / discs ──────────────────────
-STUDY_PATH = "patients/real_data/RA_2022_07_20.f22"
-STUDY_NAME = "Rat Spine 690731"
-EXP_ID = "7"
+STUDY_PATH = "patients/real_data/RA_2022_08_11.fo1"
+STUDY_NAME = "690736"
+EXP_ID = "6"
 KIND = "adc"  # "t2" or "adc"
 TARGET_ROIS: list[str] | None = None  # None = every saved ROI for this map
 # ───────────────────────────────────────────────────────────────────────────
@@ -56,7 +61,9 @@ def _load_raw_stack(study_path: Path, exp_id: str, study_name: str, kind: str):
     b-values), moved to axis 0: ``(n_points, *spatial)`` — matching the
     spatial shape the saved map/diagnostics already use.
     """
-    result = load_2dseq(study_path, exp_id=exp_id, proc_id="1", study_name=study_name, zoom_to=0)
+    result = load_2dseq(
+        study_path, exp_id=exp_id, proc_id="1", study_name=study_name, zoom_to=0
+    )
 
     if kind == "t2":
         fg = next((fg for fg in result.frame_groups if "ECHO" in fg.name), None)
@@ -65,18 +72,32 @@ def _load_raw_stack(study_path: Path, exp_id: str, study_name: str, kind: str):
         x = np.array(_parse_te_labels(fg.labels))
     else:
         fg = next(
-            (fg for fg in result.frame_groups if "MOVIE" in fg.name or "DIFFUSION" in fg.name),
+            (
+                fg
+                for fg in result.frame_groups
+                if "MOVIE" in fg.name or "DIFFUSION" in fg.name
+            ),
             None,
         )
         if fg is None:
-            raise RuntimeError(f"No diffusion frame group found in {study_name} exp {exp_id}.")
+            raise RuntimeError(
+                f"No diffusion frame group found in {study_name} exp {exp_id}."
+            )
         x = np.array(_read_dw_eff_bval(study_path / exp_id / "method"))
 
     stack = np.moveaxis(result.data, fg.axis, 0)  # (n_points, *spatial)
     return stack, x
 
 
-def plot_roi_fit(ax, roi, stack: np.ndarray, x: np.ndarray, map_data: np.ndarray, diagnostics: dict, kind: str) -> None:
+def plot_roi_fit(
+    ax,
+    roi,
+    stack: np.ndarray,
+    x: np.ndarray,
+    map_data: np.ndarray,
+    diagnostics: dict,
+    kind: str,
+) -> None:
     """Plot one ROI's measured decay points + each pixel's fitted curve onto ``ax``."""
     mask = rasterize_roi(roi, map_data.shape)
     pixel_idx = np.argwhere(mask)
@@ -94,14 +115,24 @@ def plot_roi_fit(ax, roi, stack: np.ndarray, x: np.ndarray, map_data: np.ndarray
             continue  # excluded/failed/out-of-range pixel — nothing to plot
         signal = stack[(slice(None), *idx)]
         ax.scatter(x, signal, s=10, alpha=0.35, color="tab:blue")
-        ax.plot(x_smooth, predict(x_smooth, bias[idx], s0[idx], p), alpha=0.35, color="tab:orange", linewidth=1)
+        ax.plot(
+            x_smooth,
+            predict(x_smooth, bias[idx], s0[idx], p),
+            alpha=0.35,
+            color="tab:orange",
+            linewidth=1,
+        )
         r2_vals.append(r2[idx])
 
     n = len(r2_vals)
     mean_param = np.nanmean(param[mask])
     unit = "ms" if kind == "t2" else "mm^2/s"
     title = f"{roi.name} ({roi.tissue or '?'})  n={n}"
-    subtitle = f"mean {kind.upper()}={mean_param:.4g}{unit}  mean R2={np.nanmean(r2_vals):.3f}" if n else "no fitted pixels"
+    subtitle = (
+        f"mean {kind.upper()}={mean_param:.4g}{unit}  mean R2={np.nanmean(r2_vals):.3f}"
+        if n
+        else "no fitted pixels"
+    )
     ax.set_title(f"{title}\n{subtitle}", fontsize=9)
     ax.set_xlabel("TE (ms)" if kind == "t2" else "b-value (s/mm^2)")
     ax.set_ylabel("signal (a.u.)")
@@ -122,7 +153,9 @@ def main() -> None:
     if TARGET_ROIS:
         rois = [r for r in rois if r.name in TARGET_ROIS]
     if not rois:
-        raise RuntimeError(f"No matching saved ROIs for {STUDY_NAME} exp {EXP_ID} ({KIND}).")
+        raise RuntimeError(
+            f"No matching saved ROIs for {STUDY_NAME} exp {EXP_ID} ({KIND})."
+        )
 
     print(f"Reloading raw proc 1 stack for {STUDY_NAME} exp {EXP_ID}...")
     stack, x = _load_raw_stack(study_path, EXP_ID, STUDY_NAME, KIND)
@@ -130,14 +163,18 @@ def main() -> None:
     n = len(rois)
     ncols = min(3, n)
     nrows = -(-n // ncols)  # ceil
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 3.5 * nrows), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4.5 * ncols, 3.5 * nrows), squeeze=False
+    )
 
     for ax, roi in zip(axes.flat, rois):
         plot_roi_fit(ax, roi, stack, x, map_result.data, map_result.diagnostics, KIND)
     for ax in axes.flat[n:]:
         ax.axis("off")
 
-    fig.suptitle(f"{STUDY_NAME} exp {EXP_ID} ({KIND.upper()}) — measured signal (blue) vs fitted curve (orange), per pixel")
+    fig.suptitle(
+        f"{STUDY_NAME} exp {EXP_ID} ({KIND.upper()}) — measured signal (blue) vs fitted curve (orange), per pixel"
+    )
     fig.tight_layout()
     plt.show()
 
