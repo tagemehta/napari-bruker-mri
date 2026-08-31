@@ -39,6 +39,7 @@ trying to do" to the file that does it:
 | Figure out which scans are repeats vs. genuinely different disc locations (Top vs Bottom) | `inspect_scan_positions.py` |
 | Visually confirm Top vs Bottom by projecting a scan onto the sagittal localizer | `plot_disc_positions_on_sagittal.py` |
 | Attach each ROI's irradiation Group / timepoint to its stats            | `join_roi_stats_grouping.py`        |
+| Generate Top/Bottom labels for every analyzed disc, cohort-wide          | `label_disc_top_bottom.py`          |
 | Filter out noisy/poorly-fit pixels and compare irradiated vs. control trends, with t-tests | `snr_filter_and_compare.py` |
 | Export raw Bruker scans to NIfTI (e.g. for 3D Slicer)                    | `export_nifti_studies.py`           |
 | Figure out what an exported NIfTI file actually is                      | `label_nifti_exports.py`            |
