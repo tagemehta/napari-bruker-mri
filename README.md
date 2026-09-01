@@ -40,7 +40,7 @@ trying to do" to the file that does it:
 | Visually confirm Top vs Bottom by projecting a scan onto the sagittal localizer | `plot_disc_positions_on_sagittal.py` |
 | Attach each ROI's irradiation Group / timepoint to its stats            | `join_roi_stats_grouping.py`        |
 | Generate Top/Bottom labels for every analyzed disc, cohort-wide          | `label_disc_top_bottom.py`          |
-| Filter out noisy/poorly-fit pixels and compare irradiated vs. control trends, with t-tests | `snr_filter_and_compare.py` |
+| Compare irradiated vs. control trends across timepoints, with t-tests   | `compare_trends.py`                 |
 | Export raw Bruker scans to NIfTI (e.g. for 3D Slicer)                    | `export_nifti_studies.py`           |
 | Figure out what an exported NIfTI file actually is                      | `label_nifti_exports.py`            |
 
@@ -54,7 +54,7 @@ the constants at the top (study path, experiment ID, etc.), then
 2. `inspect_scan_positions.py` + `plot_disc_positions_on_sagittal.py` — confirm Top vs. Bottom disc and which experiment IDs are repeats.
 3. `analyze_disc.py` — fit T2/ADC maps and draw ROIs for that disc.
 4. `join_roi_stats_grouping.py` — attach cohort/timepoint metadata to the new ROI stats.
-5. `snr_filter_and_compare.py` — re-run once new discs are added, to refresh the filtered stats and trend/t-test tables across the whole cohort.
+5. `compare_trends.py` — re-run once new discs are added, to refresh the trend/t-test tables across the whole cohort.
 
 ## Data layout supported
 
