@@ -1,7 +1,23 @@
 """
-Compare irradiated vs. control ROI trends across every available timepoint,
-with pooled and per-timepoint Welch's t-tests — run with:
+Compare irradiated vs. control ROI trends across every available timepoint —
+run with:
     uv run python compare_trends.py
+
+Statistics, in three parts:
+  1. Pooled Welch's t-test — irradiated (all timepoints) vs control (0d +
+     28d-C pooled). Just two groups, so no missing-cell issue.
+  2. Omnibus one-way ANOVA across 5 conditions (0d-control, 7d-irr, 14d-irr,
+     28d-irr, 28d-C-control) as an overall "is anything different anywhere"
+     check. A full Group x Timepoint two-way ANOVA isn't usable here:
+     irradiated rats are never scanned at 0d and control rats are never
+     scanned at 7d/14d, so several (group, timepoint) cells are
+     structurally empty, not just small — a two-way model can't estimate
+     an interaction from that.
+  3. Three planned contrasts (7d-irr vs 0d-control, 14d-irr vs 0d-control,
+     28d-irr vs 28d-C-control) via Welch's t-test, Benjamini-Hochberg
+     FDR-corrected across the whole family (3 contrasts x 8 tissue/map_kind/
+     region_type combinations), since testing each timepoint independently
+     with no correction inflates the false-positive rate across the family.
 
 Reads parameter_maps/roi_stats_with_grouping.csv directly (no raw-map/ROI
 reloading needed) — run join_roi_stats_grouping.py first if that file
@@ -134,14 +150,38 @@ def main() -> None:
     ttest_df = pd.DataFrame.from_records(ttest_rows).sort_values("p_value")
     print(ttest_df.round(5).to_string(index=False))
 
+    # --- Per-timepoint comparison: one-way ANOVA + planned contrasts -------
+    #
+    # A full Group x Timepoint two-way ANOVA isn't estimable here: irradiated
+    # rats are never scanned at 0d and control rats are never scanned at
+    # 7d/14d, so several (group, timepoint) cells are structurally empty, not
+    # just small. Instead, each rat is assigned one of 5 mutually-exclusive
+    # conditions, and:
+    #   1. An omnibus one-way ANOVA across all 5 conditions checks whether
+    #      there's any difference anywhere, as an overall sanity check.
+    #   2. Only the 3 biologically meaningful contrasts are actually tested
+    #      (7d-irr vs 0d-control, 14d-irr vs 0d-control, 28d-irr vs
+    #      28d-C-control) via Welch's t-test — comparing every condition to
+    #      every other (e.g. 0d-control vs 28d-C-control) would answer
+    #      questions nobody's asking here.
+    #   3. Because that's still many tests (3 contrasts x 8 tissue/map_kind/
+    #      region_type combinations = 24), a Benjamini-Hochberg FDR
+    #      correction is applied across the whole family, so the reported
+    #      significance isn't just each test's own uncorrected p-value.
+    print("\n=== Per-timepoint irradiated vs control — one-way ANOVA (5 conditions) ===")
     print(
-        "\n=== Per-timepoint irradiated vs control — Welch's t-test, one value per rat ==="
+        "(one value per rat; conditions = 0d-control, 7d-irr, 14d-irr, 28d-irr, "
+        "28d-C-control — this is an omnibus check across all 5, not the pairwise "
+        "comparisons of interest, which follow below)\n"
     )
-    print(
-        "(7d/14d irradiated compared against the 0d baseline control, since neither "
-        "has a time-matched control cohort; 28d irradiated compared against the "
-        "time-matched 28d-C control)\n"
-    )
+
+    def _condition(row) -> str | None:
+        if row["cohort"] == "control" and row["test_end_point"] in ("0d", "28d-C"):
+            return f"{row['test_end_point']}-control"
+        if row["cohort"] == "irradiated" and row["test_end_point"] in ("7d", "14d", "28d"):
+            return f"{row['test_end_point']}-irr"
+        return None
+
     per_rat_tp = (
         stats_df.groupby(
             ["tissue", "map_kind", "region_type", "test_end_point", "cohort", "study_name"]
@@ -149,46 +189,74 @@ def main() -> None:
         .agg(rat_mean=("mean", "mean"))
         .reset_index()
     )
-    _CONTROL_FOR = {"7d": "0d", "14d": "0d", "28d": "28d-C"}
-    tp_rows = []
-    for irr_tp, ctrl_tp in _CONTROL_FOR.items():
-        irr_all = per_rat_tp[
-            (per_rat_tp["test_end_point"] == irr_tp) & (per_rat_tp["cohort"] == "irradiated")
-        ]
-        ctl_all = per_rat_tp[
-            (per_rat_tp["test_end_point"] == ctrl_tp) & (per_rat_tp["cohort"] == "control")
-        ]
-        for (tissue, map_kind, region_type), irr_grp in irr_all.groupby(
+    per_rat_tp["condition"] = per_rat_tp.apply(_condition, axis=1)
+    per_rat_tp = per_rat_tp.dropna(subset=["condition"])
+
+    anova_rows = []
+    for (tissue, map_kind, region_type), grp in per_rat_tp.groupby(
+        ["tissue", "map_kind", "region_type"]
+    ):
+        groups = [g["rat_mean"].to_numpy() for _, g in grp.groupby("condition")]
+        if len(groups) < 2:
+            continue
+        f_stat, p_val = stats.f_oneway(*groups)
+        anova_rows.append({
+            "tissue": tissue, "map_kind": map_kind, "region_type": region_type,
+            "n_conditions": len(groups), "f_stat": f_stat, "p_value": p_val,
+        })
+    anova_df = pd.DataFrame.from_records(anova_rows).sort_values("p_value")
+    print(anova_df.round(5).to_string(index=False))
+
+    print(
+        "\n=== Planned contrasts — Welch's t-test, Benjamini-Hochberg FDR-corrected ==="
+    )
+    print(
+        "(7d/14d irradiated compared against the 0d baseline control, since neither "
+        "has a time-matched control cohort; 28d irradiated compared against the "
+        "time-matched 28d-C control; p_adj controls the false discovery rate across "
+        "all contrasts x tissue x map_kind x region_type combinations together)\n"
+    )
+    _CONTRASTS = [("7d-irr", "0d-control"), ("14d-irr", "0d-control"), ("28d-irr", "28d-C-control")]
+    contrast_rows = []
+    for irr_cond, ctl_cond in _CONTRASTS:
+        for (tissue, map_kind, region_type), grp in per_rat_tp.groupby(
             ["tissue", "map_kind", "region_type"]
         ):
-            ctl_grp = ctl_all[
-                (ctl_all["tissue"] == tissue)
-                & (ctl_all["map_kind"] == map_kind)
-                & (ctl_all["region_type"] == region_type)
-            ]
-            irr = irr_grp["rat_mean"]
-            ctl = ctl_grp["rat_mean"]
+            irr = grp[grp["condition"] == irr_cond]["rat_mean"]
+            ctl = grp[grp["condition"] == ctl_cond]["rat_mean"]
             if len(irr) < 2 or len(ctl) < 2:
                 continue
             t_stat, p_val = stats.ttest_ind(irr, ctl, equal_var=False)
-            tp_rows.append(
-                {
-                    "timepoint": irr_tp,
-                    "vs_control": ctrl_tp,
-                    "tissue": tissue,
-                    "map_kind": map_kind,
-                    "region_type": region_type,
-                    "n_irradiated": len(irr),
-                    "n_control": len(ctl),
-                    "mean_irradiated": irr.mean(),
-                    "mean_control": ctl.mean(),
-                    "pct_diff": (irr.mean() - ctl.mean()) / ctl.mean() * 100,
-                    "t_stat": t_stat,
-                    "p_value": p_val,
-                }
-            )
-    tp_df = pd.DataFrame.from_records(tp_rows).sort_values(["timepoint", "p_value"])
-    print(tp_df.round(5).to_string(index=False))
+            contrast_rows.append({
+                "contrast": f"{irr_cond} vs {ctl_cond}",
+                "tissue": tissue,
+                "map_kind": map_kind,
+                "region_type": region_type,
+                "n_irradiated": len(irr),
+                "n_control": len(ctl),
+                "mean_irradiated": irr.mean(),
+                "mean_control": ctl.mean(),
+                "pct_diff": (irr.mean() - ctl.mean()) / ctl.mean() * 100,
+                "t_stat": t_stat,
+                "p_value": p_val,
+            })
+    contrast_df = pd.DataFrame.from_records(contrast_rows)
+    contrast_df["p_adj"] = _benjamini_hochberg(contrast_df["p_value"].to_numpy())
+    contrast_df = contrast_df.sort_values("p_adj")
+    print(contrast_df.round(5).to_string(index=False))
+
+
+def _benjamini_hochberg(p_values):
+    """Benjamini-Hochberg FDR-adjusted p-values (same order as the input)."""
+    n = len(p_values)
+    order = p_values.argsort()
+    ranked = p_values[order] * n / (pd.Series(range(1, n + 1)))
+    # Enforce monotonicity: adjusted p-values must not decrease going up in rank.
+    adjusted = ranked.to_numpy()[::-1]
+    adjusted = pd.Series(adjusted).cummin().to_numpy()[::-1]
+    adjusted = adjusted.clip(max=1.0)
+    out = pd.Series(index=order, data=adjusted).sort_index()
+    return out.to_numpy()
 
 
 if __name__ == "__main__":
