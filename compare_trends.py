@@ -3,21 +3,27 @@ Compare irradiated vs. control ROI trends across every available timepoint —
 run with:
     uv run python compare_trends.py
 
-Statistics, in three parts:
-  1. Pooled Welch's t-test — irradiated (all timepoints) vs control (0d +
-     28d-C pooled). Just two groups, so no missing-cell issue.
-  2. Omnibus one-way ANOVA across 5 conditions (0d-control, 7d-irr, 14d-irr,
+Statistics, in two parts:
+  1. Omnibus one-way ANOVA across 5 conditions (0d-control, 7d-irr, 14d-irr,
      28d-irr, 28d-C-control) as an overall "is anything different anywhere"
      check. A full Group x Timepoint two-way ANOVA isn't usable here:
      irradiated rats are never scanned at 0d and control rats are never
      scanned at 7d/14d, so several (group, timepoint) cells are
      structurally empty, not just small — a two-way model can't estimate
-     an interaction from that.
-  3. Three planned contrasts (7d-irr vs 0d-control, 14d-irr vs 0d-control,
-     28d-irr vs 28d-C-control) via Welch's t-test, Benjamini-Hochberg
-     FDR-corrected across the whole family (3 contrasts x 8 tissue/map_kind/
-     region_type combinations), since testing each timepoint independently
-     with no correction inflates the false-positive rate across the family.
+     an interaction from that. (There's deliberately no single pooled
+     "irradiated vs control" test: pooling 0d — a pre-treatment baseline —
+     with 28d-C — a time-matched sham — into one "control" bucket, and all
+     three post-irradiation timepoints into one "irradiated" bucket, blurs
+     exactly the timepoint structure this analysis cares about.)
+  2. Planned contrasts via Welch's t-test, Benjamini-Hochberg FDR-corrected
+     across the whole family (5 contrasts x 8 tissue/map_kind/region_type
+     combinations = 40 tests). Two kinds:
+       - vs-control: 7d-irr vs 0d-control, 14d-irr vs 0d-control, 28d-irr
+         vs 28d-C-control (7d/14d have no time-matched control, so they're
+         compared against the 0d baseline instead).
+       - timepoint-to-timepoint, within the irradiated cohort only: 7d-irr
+         vs 14d-irr, 14d-irr vs 28d-irr — does the irradiated group itself
+         change over time, independent of any control comparison.
 
 Reads parameter_maps/roi_stats_with_grouping.csv directly (no raw-map/ROI
 reloading needed) — run join_roi_stats_grouping.py first if that file
@@ -111,45 +117,6 @@ def main() -> None:
     )
     print(samples.to_string())
 
-    print(
-        "\n=== Irradiated (all timepoints pooled) vs Control (0d + 28d-C pooled) — "
-        "Welch's t-test, one value per rat ==="
-    )
-    print(
-        "(per-rat value = mean of that rat's ROI mean values, so each rat "
-        "contributes once regardless of how many ROIs/timepoints it has)\n"
-    )
-    per_rat = (
-        stats_df.groupby(["tissue", "map_kind", "region_type", "cohort", "study_name"])
-        .agg(rat_mean=("mean", "mean"))
-        .reset_index()
-    )
-    ttest_rows = []
-    for (tissue, map_kind, region_type), grp in per_rat.groupby(
-        ["tissue", "map_kind", "region_type"]
-    ):
-        irr = grp[grp["cohort"] == "irradiated"]["rat_mean"]
-        ctl = grp[grp["cohort"] == "control"]["rat_mean"]
-        if len(irr) < 2 or len(ctl) < 2:
-            continue
-        t_stat, p_val = stats.ttest_ind(irr, ctl, equal_var=False)
-        ttest_rows.append(
-            {
-                "tissue": tissue,
-                "map_kind": map_kind,
-                "region_type": region_type,
-                "n_irradiated": len(irr),
-                "n_control": len(ctl),
-                "mean_irradiated": irr.mean(),
-                "mean_control": ctl.mean(),
-                "pct_diff": (irr.mean() - ctl.mean()) / ctl.mean() * 100,
-                "t_stat": t_stat,
-                "p_value": p_val,
-            }
-        )
-    ttest_df = pd.DataFrame.from_records(ttest_rows).sort_values("p_value")
-    print(ttest_df.round(5).to_string(index=False))
-
     # --- Per-timepoint comparison: one-way ANOVA + planned contrasts -------
     #
     # A full Group x Timepoint two-way ANOVA isn't estimable here: irradiated
@@ -159,13 +126,19 @@ def main() -> None:
     # conditions, and:
     #   1. An omnibus one-way ANOVA across all 5 conditions checks whether
     #      there's any difference anywhere, as an overall sanity check.
-    #   2. Only the 3 biologically meaningful contrasts are actually tested
-    #      (7d-irr vs 0d-control, 14d-irr vs 0d-control, 28d-irr vs
-    #      28d-C-control) via Welch's t-test — comparing every condition to
-    #      every other (e.g. 0d-control vs 28d-C-control) would answer
-    #      questions nobody's asking here.
-    #   3. Because that's still many tests (3 contrasts x 8 tissue/map_kind/
-    #      region_type combinations = 24), a Benjamini-Hochberg FDR
+    #   2. Only the biologically meaningful contrasts are actually tested via
+    #      Welch's t-test — comparing every condition to every other (e.g.
+    #      0d-control vs 28d-C-control) would answer questions nobody's
+    #      asking here. Two kinds of contrast:
+    #        - vs. control: 7d-irr vs 0d-control, 14d-irr vs 0d-control,
+    #          28d-irr vs 28d-C-control (7d/14d have no time-matched control,
+    #          so they're compared against the 0d baseline instead).
+    #        - timepoint-to-timepoint, within the irradiated cohort only:
+    #          7d-irr vs 14d-irr, 14d-irr vs 28d-irr — does the irradiated
+    #          group itself change as time passes, independent of any
+    #          control comparison.
+    #   3. Because that's still many tests (5 contrasts x 8 tissue/map_kind/
+    #      region_type combinations = 40), a Benjamini-Hochberg FDR
     #      correction is applied across the whole family, so the reported
     #      significance isn't just each test's own uncorrected p-value.
     print("\n=== Per-timepoint irradiated vs control — one-way ANOVA (5 conditions) ===")
@@ -211,32 +184,41 @@ def main() -> None:
         "\n=== Planned contrasts — Welch's t-test, Benjamini-Hochberg FDR-corrected ==="
     )
     print(
-        "(7d/14d irradiated compared against the 0d baseline control, since neither "
-        "has a time-matched control cohort; 28d irradiated compared against the "
-        "time-matched 28d-C control; p_adj controls the false discovery rate across "
-        "all contrasts x tissue x map_kind x region_type combinations together)\n"
+        "(vs-control: 7d/14d-irr compared against the 0d baseline control, since "
+        "neither has a time-matched control cohort; 28d-irr compared against the "
+        "time-matched 28d-C control. timepoint-to-timepoint: irradiated cohort "
+        "compared against itself at the previous timepoint, independent of control. "
+        "p_adj controls the false discovery rate across all contrasts x tissue x "
+        "map_kind x region_type combinations together)\n"
     )
-    _CONTRASTS = [("7d-irr", "0d-control"), ("14d-irr", "0d-control"), ("28d-irr", "28d-C-control")]
+    _CONTRASTS = [
+        ("7d-irr", "0d-control", "vs-control"),
+        ("14d-irr", "0d-control", "vs-control"),
+        ("28d-irr", "28d-C-control", "vs-control"),
+        ("14d-irr", "7d-irr", "timepoint-to-timepoint"),
+        ("28d-irr", "14d-irr", "timepoint-to-timepoint"),
+    ]
     contrast_rows = []
-    for irr_cond, ctl_cond in _CONTRASTS:
+    for cond_a, cond_b, kind in _CONTRASTS:
         for (tissue, map_kind, region_type), grp in per_rat_tp.groupby(
             ["tissue", "map_kind", "region_type"]
         ):
-            irr = grp[grp["condition"] == irr_cond]["rat_mean"]
-            ctl = grp[grp["condition"] == ctl_cond]["rat_mean"]
-            if len(irr) < 2 or len(ctl) < 2:
+            a = grp[grp["condition"] == cond_a]["rat_mean"]
+            b = grp[grp["condition"] == cond_b]["rat_mean"]
+            if len(a) < 2 or len(b) < 2:
                 continue
-            t_stat, p_val = stats.ttest_ind(irr, ctl, equal_var=False)
+            t_stat, p_val = stats.ttest_ind(a, b, equal_var=False)
             contrast_rows.append({
-                "contrast": f"{irr_cond} vs {ctl_cond}",
+                "contrast": f"{cond_a} vs {cond_b}",
+                "kind": kind,
                 "tissue": tissue,
                 "map_kind": map_kind,
                 "region_type": region_type,
-                "n_irradiated": len(irr),
-                "n_control": len(ctl),
-                "mean_irradiated": irr.mean(),
-                "mean_control": ctl.mean(),
-                "pct_diff": (irr.mean() - ctl.mean()) / ctl.mean() * 100,
+                "n_a": len(a),
+                "n_b": len(b),
+                "mean_a": a.mean(),
+                "mean_b": b.mean(),
+                "pct_diff": (a.mean() - b.mean()) / b.mean() * 100,
                 "t_stat": t_stat,
                 "p_value": p_val,
             })
