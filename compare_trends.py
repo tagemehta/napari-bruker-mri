@@ -54,7 +54,15 @@ from scipy import stats
 
 STATS_PATH = "parameter_maps/roi_stats_with_grouping.csv"
 
-_IRRADIATED_GROUPS = {"Group 1", "Group 2", "Group 3", "Group 4", "Group 5", "Group 6", "extra"}
+_IRRADIATED_GROUPS = {
+    "Group 1",
+    "Group 2",
+    "Group 3",
+    "Group 4",
+    "Group 5",
+    "Group 6",
+    "extra",
+}
 _CONTROL_LABEL = "Control"
 
 # Per-user convention (ROI names as drawn in roi_annotator_widget.py):
@@ -79,18 +87,102 @@ def _cohort(group: str) -> str:
     return "other"
 
 
-def main() -> None:
-    stats_df = pd.read_csv(STATS_PATH).dropna(subset=["study_name"])
+def _condition(row) -> str | None:
+    if row["cohort"] == "control" and row["test_end_point"] in ("0d", "28d-C"):
+        return f"{row['test_end_point']}-control"
+    if row["cohort"] == "irradiated" and row["test_end_point"] in ("7d", "14d", "28d"):
+        return f"{row['test_end_point']}-irr"
+    return None
+
+
+# Planned contrasts, reused by both the console report (below) and
+# roi_stats_plots.py's t-test summary figure.
+CONTRASTS = [
+    ("7d-irr", "0d-control", "vs-control"),
+    ("14d-irr", "0d-control", "vs-control"),
+    ("28d-irr", "28d-C-control", "vs-control"),
+    ("14d-irr", "7d-irr", "timepoint-to-timepoint"),
+    ("28d-irr", "14d-irr", "timepoint-to-timepoint"),
+]
+
+
+def load_and_annotate(stats_path: str = STATS_PATH) -> pd.DataFrame:
+    """Read roi_stats_with_grouping.csv and attach cohort/tissue/region_type
+    columns. Shared by the console report below and roi_stats_plots.py."""
+    stats_df = pd.read_csv(stats_path).dropna(subset=["study_name"])
     stats_df["cohort"] = stats_df["group"].map(_cohort)
     stats_df = stats_df[stats_df["cohort"] != "other"]
-    tissue_region = stats_df["roi_name"].apply(lambda r: _ROI_TISSUE.get(r, ("unknown", "unknown")))
+    tissue_region = stats_df["roi_name"].apply(
+        lambda r: _ROI_TISSUE.get(r, ("unknown", "unknown"))
+    )
     stats_df["tissue"] = tissue_region.apply(lambda t: t[0])
     stats_df["region_type"] = tissue_region.apply(lambda t: t[1])
+    return stats_df
+
+
+def per_rat_timepoint_means(stats_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per (tissue, map_kind, region_type, condition, rat), averaging
+    away any duplicate ROIs of the same tissue for that rat/timepoint."""
+    per_rat_tp = (
+        stats_df
+        .groupby([
+            "tissue",
+            "map_kind",
+            "region_type",
+            "test_end_point",
+            "cohort",
+            "study_name",
+        ])
+        .agg(rat_mean=("mean", "mean"))
+        .reset_index()
+    )
+    per_rat_tp["condition"] = per_rat_tp.apply(_condition, axis=1)
+    return per_rat_tp.dropna(subset=["condition"])
+
+
+def compute_planned_contrasts(per_rat_tp: pd.DataFrame) -> pd.DataFrame:
+    """Welch's t-test for each of CONTRASTS x (tissue, map_kind, region_type),
+    FDR-corrected (Benjamini-Hochberg) across the whole family."""
+    contrast_rows = []
+    for cond_a, cond_b, kind in CONTRASTS:
+        for (tissue, map_kind, region_type), grp in per_rat_tp.groupby([
+            "tissue",
+            "map_kind",
+            "region_type",
+        ]):
+            a = grp[grp["condition"] == cond_a]["rat_mean"]
+            b = grp[grp["condition"] == cond_b]["rat_mean"]
+            if len(a) < 2 or len(b) < 2:
+                continue
+            t_stat, p_val = stats.ttest_ind(a, b, equal_var=False)
+            contrast_rows.append({
+                "contrast": f"{cond_a} vs {cond_b}",
+                "kind": kind,
+                "tissue": tissue,
+                "map_kind": map_kind,
+                "region_type": region_type,
+                "n_a": len(a),
+                "n_b": len(b),
+                "mean_a": a.mean(),
+                "mean_b": b.mean(),
+                "pct_diff": (a.mean() - b.mean()) / b.mean() * 100,
+                "t_stat": t_stat,
+                "p_value": p_val,
+            })
+    contrast_df = pd.DataFrame.from_records(contrast_rows)
+    contrast_df["p_adj"] = _benjamini_hochberg(contrast_df["p_value"].to_numpy())
+    return contrast_df.sort_values("p_adj")
+
+
+def main() -> None:
+    stats_df = load_and_annotate()
 
     pd.set_option("display.width", 160)
     pd.set_option("display.max_rows", None)
 
-    print("=== Irradiated vs Control by timepoint — whole-region ROI (ROI 1=NP, ROI 2=AF) ===")
+    print(
+        "=== Irradiated vs Control by timepoint — whole-region ROI (ROI 1=NP, ROI 2=AF) ==="
+    )
     whole = (
         stats_df[stats_df["region_type"] == "whole"]
         .groupby(["tissue", "map_kind", "test_end_point", "cohort"])
@@ -103,7 +195,9 @@ def main() -> None:
     )
     print(whole.to_string())
 
-    print("\n=== Irradiated vs Control by timepoint — sampling squares (ROI 3/4=NP, ROI 5/6/7=AF) ===")
+    print(
+        "\n=== Irradiated vs Control by timepoint — sampling squares (ROI 3/4=NP, ROI 5/6/7=AF) ==="
+    )
     samples = (
         stats_df[stats_df["region_type"] == "sample"]
         .groupby(["tissue", "map_kind", "test_end_point", "cohort"])
@@ -141,41 +235,34 @@ def main() -> None:
     #      region_type combinations = 40), a Benjamini-Hochberg FDR
     #      correction is applied across the whole family, so the reported
     #      significance isn't just each test's own uncorrected p-value.
-    print("\n=== Per-timepoint irradiated vs control — one-way ANOVA (5 conditions) ===")
+    print(
+        "\n=== Per-timepoint irradiated vs control — one-way ANOVA (5 conditions) ==="
+    )
     print(
         "(one value per rat; conditions = 0d-control, 7d-irr, 14d-irr, 28d-irr, "
         "28d-C-control — this is an omnibus check across all 5, not the pairwise "
         "comparisons of interest, which follow below)\n"
     )
 
-    def _condition(row) -> str | None:
-        if row["cohort"] == "control" and row["test_end_point"] in ("0d", "28d-C"):
-            return f"{row['test_end_point']}-control"
-        if row["cohort"] == "irradiated" and row["test_end_point"] in ("7d", "14d", "28d"):
-            return f"{row['test_end_point']}-irr"
-        return None
-
-    per_rat_tp = (
-        stats_df.groupby(
-            ["tissue", "map_kind", "region_type", "test_end_point", "cohort", "study_name"]
-        )
-        .agg(rat_mean=("mean", "mean"))
-        .reset_index()
-    )
-    per_rat_tp["condition"] = per_rat_tp.apply(_condition, axis=1)
-    per_rat_tp = per_rat_tp.dropna(subset=["condition"])
+    per_rat_tp = per_rat_timepoint_means(stats_df)
 
     anova_rows = []
-    for (tissue, map_kind, region_type), grp in per_rat_tp.groupby(
-        ["tissue", "map_kind", "region_type"]
-    ):
+    for (tissue, map_kind, region_type), grp in per_rat_tp.groupby([
+        "tissue",
+        "map_kind",
+        "region_type",
+    ]):
         groups = [g["rat_mean"].to_numpy() for _, g in grp.groupby("condition")]
         if len(groups) < 2:
             continue
         f_stat, p_val = stats.f_oneway(*groups)
         anova_rows.append({
-            "tissue": tissue, "map_kind": map_kind, "region_type": region_type,
-            "n_conditions": len(groups), "f_stat": f_stat, "p_value": p_val,
+            "tissue": tissue,
+            "map_kind": map_kind,
+            "region_type": region_type,
+            "n_conditions": len(groups),
+            "f_stat": f_stat,
+            "p_value": p_val,
         })
     anova_df = pd.DataFrame.from_records(anova_rows).sort_values("p_value")
     print(anova_df.round(5).to_string(index=False))
@@ -191,40 +278,7 @@ def main() -> None:
         "p_adj controls the false discovery rate across all contrasts x tissue x "
         "map_kind x region_type combinations together)\n"
     )
-    _CONTRASTS = [
-        ("7d-irr", "0d-control", "vs-control"),
-        ("14d-irr", "0d-control", "vs-control"),
-        ("28d-irr", "28d-C-control", "vs-control"),
-        ("14d-irr", "7d-irr", "timepoint-to-timepoint"),
-        ("28d-irr", "14d-irr", "timepoint-to-timepoint"),
-    ]
-    contrast_rows = []
-    for cond_a, cond_b, kind in _CONTRASTS:
-        for (tissue, map_kind, region_type), grp in per_rat_tp.groupby(
-            ["tissue", "map_kind", "region_type"]
-        ):
-            a = grp[grp["condition"] == cond_a]["rat_mean"]
-            b = grp[grp["condition"] == cond_b]["rat_mean"]
-            if len(a) < 2 or len(b) < 2:
-                continue
-            t_stat, p_val = stats.ttest_ind(a, b, equal_var=False)
-            contrast_rows.append({
-                "contrast": f"{cond_a} vs {cond_b}",
-                "kind": kind,
-                "tissue": tissue,
-                "map_kind": map_kind,
-                "region_type": region_type,
-                "n_a": len(a),
-                "n_b": len(b),
-                "mean_a": a.mean(),
-                "mean_b": b.mean(),
-                "pct_diff": (a.mean() - b.mean()) / b.mean() * 100,
-                "t_stat": t_stat,
-                "p_value": p_val,
-            })
-    contrast_df = pd.DataFrame.from_records(contrast_rows)
-    contrast_df["p_adj"] = _benjamini_hochberg(contrast_df["p_value"].to_numpy())
-    contrast_df = contrast_df.sort_values("p_adj")
+    contrast_df = compute_planned_contrasts(per_rat_tp)
     print(contrast_df.round(5).to_string(index=False))
 
 

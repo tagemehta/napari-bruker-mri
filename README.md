@@ -12,6 +12,32 @@ A napari-based browser for Bruker ParaVision MRI study folders.
 - **Display upsampling** — small acquisition matrices (e.g. 48×48 MSME) are upsampled to 256 px using cubic spline interpolation, matching ParaVision's default display.
 - **Parameter map browser** — right-panel widget lists any T2/ADC maps (and ROI sets) already generated for the loaded study and loads them into the viewer on click. See [Per-disc T2/ADC + ROI analysis](#per-disc-t2adc--roi-analysis) below.
 
+## Installation
+
+Requires [uv](https://docs.astral.sh/uv/) (manages the Python version and
+all dependencies below — no separate `pip install` step needed) and Python
+3.12 (pinned in `.python-version`; `uv` will fetch it automatically if it's
+not already installed).
+
+```bash
+git clone <repo-url>
+cd mri-viewer
+uv sync
+```
+
+`uv sync` creates `.venv/` and installs every dependency pinned in
+`uv.lock` (napari, brukerapi, scipy, pandas, etc. — see
+[Dependencies](#dependencies) below). Every command in this README is run
+via `uv run ...`, which uses that environment automatically — no manual
+`source .venv/bin/activate` needed.
+
+Raw Bruker study data (`patients/`) and generated outputs
+(`parameter_maps/`, `nifti_export/`) are gitignored — they aren't part of
+the repo (`patients/` is treated as source-of-truth on the scanner). Copy
+your own Bruker study folders into `patients/` before running the app; see
+[Data layout supported](#data-layout-supported) below for the expected
+structure.
+
 ## Running
 
 ```bash
